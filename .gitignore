@@ -1,0 +1,30 @@
+# macOS
+.DS_Store
+**/.DS_Store
+._*
+**/._*
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+*.egg-info/
+.venv/
+.ruff_cache/
+.pytest_cache/
+
+# Node (future frontends)
+node_modules/
+
+# Env & local
+.env
+.env.*.local
+
+# Workspace artifacts
+workspace/
+!workspace/.gitkeep
+
+# IDE
+.vscode/
+.idea/
