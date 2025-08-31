@@ -1,11 +1,11 @@
 from __future__ import annotations
 
+import json
 from typing import Any, Dict, Optional
 
 from fastapi import APIRouter, Body, HTTPException
 
-from backend.app.core.config import settings
-from backend.app.core.progress import start_job
+from backend.app.models.spec import validate_spec
 from backend.app.services.plan_service import plan_and_validate
 
 router = APIRouter(prefix="/api", tags=["plan"])
@@ -14,28 +14,36 @@ router = APIRouter(prefix="/api", tags=["plan"])
 @router.post("/plan")
 async def plan_endpoint(payload: Dict[str, Any] = Body(...)) -> Dict[str, Any]:
     """
-    Create an OmegaSpec from a short product brief.
-    Body:
-      {
-        "brief": "AI marketplace app ...",
-        "max_repairs": 1
-      }
+    Convert a 'brief' into a validated OmegaSpec (no repo writes here).
     """
-    if not settings.openai_api_key:
-        raise HTTPException(status_code=503, detail="OpenAI not configured")
-
+    spec_obj = payload.get("spec")
     brief: Optional[str] = payload.get("brief")
     max_repairs: int = int(payload.get("max_repairs", 1))
-    if not brief or not isinstance(brief, str):
-        raise HTTPException(status_code=400, detail="Missing 'brief' string")
 
-    async with start_job("plan", data={"stage": "planning"}) as (_job_id, publish):
-        await publish("deep_research", progress=0.2)
+    # Accept spec as dict OR JSON string
+    if isinstance(spec_obj, str) and spec_obj.strip():
         try:
-            spec, raw = plan_and_validate(brief, max_repairs=max_repairs)
+            spec_obj = json.loads(spec_obj)
         except Exception as e:
-            await publish("error", status="fail", data={"error": str(e)})
-            raise HTTPException(status_code=500, detail=f"Plan failed: {e}")
-        await publish("validated", progress=0.9)
+            raise HTTPException(status_code=400, detail=f"'spec' is a string but not valid JSON: {e}")
 
-    return {"status": "ok", "spec": spec.model_dump()}
+    if isinstance(spec_obj, dict):
+        try:
+            spec = validate_spec(spec_obj)
+            return {"status": "ok", "spec": spec.model_dump(), "raw": spec_obj}
+        except Exception as e:
+            raise HTTPException(status_code=400, detail=f"Invalid spec: {e}")
+
+    if not brief:
+        got_keys = list(payload.keys())
+        raise HTTPException(
+            status_code=400,
+            detail=f"Provide 'brief' or 'spec'. Got keys: {got_keys}",
+        )
+
+    try:
+        spec, raw = plan_and_validate(brief, max_repairs=max_repairs)
+        return {"status": "ok", "spec": spec.model_dump(), "raw": raw}
+    except Exception as e:
+        # Surface validation errors as JSON 400 so clients (and jq) can parse them
+        raise HTTPException(status_code=400, detail=f"Planning/validation failed: {e}")
