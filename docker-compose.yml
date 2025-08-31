@@ -1,0 +1,39 @@
+# docker-compose.yml
+version: "3.9"
+
+services:
+  omega:
+    build:
+      context: .
+      dockerfile: docker/Dockerfile
+    container_name: omega-builder
+    ports:
+      - "8000:8000"
+    # Compose auto-loads .env in the repo root; we also pass it explicitly.
+    env_file:
+      - .env
+    environment:
+      # Good defaults for dev; .env can override anything here.
+      PYTHONUNBUFFERED: "1"
+      OMEGA_RESET_ON_START: "1"
+    volumes:
+      # Live-reload: mount the repo into the container
+      - .:/app:delegated
+      # Optional: persist the workspace cache (comment out if you prefer ephemeral)
+      - omega_workspace:/app/workspace/.omega
+    command: >
+      uvicorn backend.main:app
+      --host 0.0.0.0
+      --port 8000
+      --reload
+    # If your Dockerfile sets a non-root WORKDIR, adjust the mount path above accordingly.
+    # healthcheck (optional)
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://localhost:8000/api/health"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
+      start_period: 10s
+
+volumes:
+  omega_workspace:

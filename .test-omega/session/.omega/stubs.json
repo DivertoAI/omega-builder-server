@@ -1,0 +1,18 @@
+{
+  "932b29dd-ac38-452a-a7d7-8b27b3d9b2b7": {
+    "id": "932b29dd-ac38-452a-a7d7-8b27b3d9b2b7",
+    "name": "ex",
+    "path": "/hello",
+    "env": "default",
+    "enabled": true,
+    "tags": []
+  },
+  "4d6a575e-5c88-4964-b51e-8776d65f6339": {
+    "id": "4d6a575e-5c88-4964-b51e-8776d65f6339",
+    "name": "bulk",
+    "path": "/bulk",
+    "env": "default",
+    "enabled": true,
+    "tags": []
+  }
+}

@@ -1,0 +1,23 @@
+# macOS cruft
+.DS_Store
+._*
+.Spotlight-V100
+.Trashes
+
+# Never send these to Docker
+.git
+.venv
+.pytest_cache
+.test-omega
+workspace/.omega
+assets/tmp
+__pycache__/
+*.py[cod]
+*.egg-info/
+dist
+build
+.env
+
+# Docker files themselves
+docker-compose.yml
+docker/
