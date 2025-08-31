@@ -1,395 +1,538 @@
 from __future__ import annotations
 
-import glob as _glob
 import json
 import os
+import re
 import shutil
-import stat
 from dataclasses import dataclass
-from difflib import unified_diff
 from pathlib import Path
-from typing import Any, Dict, List
+from typing import Any, Callable, Dict, List, Optional, Tuple
 
-from pydantic import BaseModel, Field
+# --------------------------------------------------------------------------------------
+# Local filesystem helpers (self-contained; no external deps)
+# --------------------------------------------------------------------------------------
 
-# --------------------------------------------------------------------------
-# Repo root resolution (same heuristic you used: go up 3 levels)
-# --------------------------------------------------------------------------
-ROOT = Path(__file__).resolve().parents[3]
+REPO_ROOT = Path(".").resolve()
 
-# Protected names (we never delete these; we also keep all ops inside ROOT)
-_FORBIDDEN = {".git", ".venv", "__pycache__", ".tox", ".mypy_cache"}
+# Ignore lists to keep scans light and noise-free
+_IGNORE_NAMES = {"__pycache__", ".git", ".venv", "node_modules"}
+_IGNORE_PREFIXES = (".",)  # hidden dotfiles/dirs
 
 
-# --------------------------------------------------------------------------
-# Safety helpers
-# --------------------------------------------------------------------------
-def _safe_path(rel_or_abs: str) -> Path:
-    """
-    Resolve a path safely inside the repository root.
-    Absolutes are allowed only if they are inside ROOT.
-    """
-    p = Path(rel_or_abs)
-    if not p.is_absolute():
-        p = (ROOT / p).resolve()
-    else:
-        p = p.resolve()
-
+def _safe_rel(p: Path) -> str:
     try:
-        p.relative_to(ROOT)
+        return str(p.relative_to(REPO_ROOT))
     except Exception:
-        raise ValueError(f"path escapes repo root: {p}")
-
-    return p
+        return str(p)
 
 
-def _ensure_parents(p: Path) -> None:
-    p.parent.mkdir(parents=True, exist_ok=True)
-
-
-def _is_forbidden(p: Path) -> bool:
-    return any(seg in _FORBIDDEN for seg in p.parts)
-
-
-# --------------------------------------------------------------------------
-# Tool Schemas (Pydantic)
-# --------------------------------------------------------------------------
-class FSReadArgs(BaseModel):
-    path: str = Field(description="File path, relative to repo root")
-    max_bytes: int = Field(default=200_000, ge=1, description="Max bytes to read (prevents huge loads)")
-
-
-class FSWriteArgs(BaseModel):
-    path: str = Field(description="File path, relative to repo root")
-    content: str = Field(description="Full new file content (UTF-8 text)")
-    mode: str = Field(default="overwrite", description="overwrite | append")
-
-
-class FSMkdirArgs(BaseModel):
-    path: str = Field(description="Directory path, relative to repo root")
-    exist_ok: bool = Field(default=True)
-
-
-class FSDeleteArgs(BaseModel):
-    path: str = Field(description="File or directory path, relative to repo root")
-    recursive: bool = Field(default=False, description="If true and path is a directory, remove recursively")
-
-
-class FSGlobArgs(BaseModel):
-    pattern: str = Field(description="Glob pattern from repo root (e.g. 'backend/**/*.py')")
-
-
-class FSMapArgs(BaseModel):
-    root: str = Field(default=".", description="Directory to scan (relative to repo root)")
-    max_depth: int = Field(default=4, ge=0, le=10)
-    include_content: bool = Field(default=False, description="Include file content when size <= 64KB")
-
-
-class FSDiffArgs(BaseModel):
-    path: str = Field(description="File to diff against")
-    new_content: str = Field(description="Proposed new content (full text)")
-
-
-class FSPatchArgs(BaseModel):
-    path: str = Field(description="File to patch")
-    patch: str = Field(description="Either full new content (strategy=replace) or a unified diff")
-    strategy: str = Field(default="replace", description="replace | unified")
-
-
-# --------------------------------------------------------------------------
-# Handlers
-# --------------------------------------------------------------------------
-def fs_map(args: FSMapArgs) -> Dict[str, Any]:
-    base = _safe_path(args.root)
+def _is_text(data: bytes) -> bool:
+    # Heuristic "looks like text"
+    if b"\x00" in data[:1024]:
+        return False
     try:
-        rel_root = str(base.relative_to(ROOT))
+        data.decode("utf-8")
+        return True
     except Exception:
-        rel_root = "."
+        return False
 
+
+def _read_file(path: Path, max_bytes: int = 200_000) -> Tuple[bool, Optional[str], bool, int]:
+    if not path.exists() or not path.is_file():
+        return False, None, False, 0
+    data = path.read_bytes()
+    size = len(data)
+    truncated = False
+    if size > max_bytes:
+        data = data[:max_bytes]
+        truncated = True
+    if not _is_text(data):
+        # Return marker for binary files
+        return True, f"<<binary:{size}bytes>>", truncated, size
+    return True, data.decode("utf-8", errors="replace"), truncated, size
+
+
+def _ensure_parent(path: Path) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+
+
+def _list_tree(root: Path, max_depth: int = 4) -> List[Dict[str, Any]]:
     entries: List[Dict[str, Any]] = []
 
-    def depth(p: Path) -> int:
-        try:
-            rel = p.relative_to(base)
-        except Exception:
-            return 0
-        return len(rel.parts)
-
-    if not base.exists():
-        return {"ok": False, "error": f"Directory not found: {args.root}"}
-
-    for p in base.rglob("*"):
-        if depth(p) > args.max_depth:
-            continue
-        if _is_forbidden(p):
-            continue
-        try:
-            rel = str(p.relative_to(ROOT))
-        except Exception:
-            continue
-
-        item: Dict[str, Any] = {
-            "path": rel,
-            "type": "dir" if p.is_dir() else "file",
-        }
-        if p.is_file():
-            try:
-                item["size"] = p.stat().st_size
-            except Exception:
-                item["size"] = None
-            if args.include_content and (item["size"] or 0) <= 64_000:
+    def walk(base: Path, depth: int):
+        if depth > max_depth:
+            return
+        for child in sorted(base.iterdir(), key=lambda p: (p.is_file(), p.name.lower())):
+            name = child.name
+            # Skip heavy/noisy and hidden
+            if name in _IGNORE_NAMES or name.startswith(_IGNORE_PREFIXES):
+                continue
+            rel = _safe_rel(child)
+            if child.is_dir():
+                entries.append({"path": rel, "type": "dir"})
+                walk(child, depth + 1)
+            else:
                 try:
-                    item["content"] = p.read_text(encoding="utf-8", errors="ignore")
+                    size = child.stat().st_size
                 except Exception:
-                    item["content"] = None
-        entries.append(item)
+                    size = None
+                entries.append({"path": rel, "type": "file", "size": size})
 
-    return {"ok": True, "root": rel_root, "entries": entries}
-
-
-def fs_glob(args: FSGlobArgs) -> Dict[str, Any]:
-    pat = str(ROOT / args.pattern)
-    matches = [
-        str(Path(m).resolve().relative_to(ROOT))
-        for m in _glob.glob(pat, recursive=True)
-    ]
-    return {"ok": True, "matches": matches[:1000]}
+    walk(root, 0)
+    return entries
 
 
-def fs_read(args: FSReadArgs) -> Dict[str, Any]:
-    p = _safe_path(args.path)
-    if not p.exists():
-        return {"ok": False, "error": f"Path not found: {args.path}"}
-    if p.is_dir():
-        return {"ok": False, "error": f"Requested path is a directory: {args.path}"}
+# --------------------------------------------------------------------------------------
+# Tool implementations
+# --------------------------------------------------------------------------------------
+
+def fs_map(root: str = ".", max_depth: int = 4, include_content: bool = False) -> Dict[str, Any]:
+    """
+    List files/folders under a path (relative to repo root). Optionally include
+    content for small text files (<= 64KB). Skips noisy dirs and hidden dotfiles.
+    """
     try:
-        data = p.read_bytes()
-        truncated = len(data) > args.max_bytes
-        if truncated:
-            data = data[: args.max_bytes]
-        try:
-            text = data.decode("utf-8")
-        except Exception:
-            text = data.decode("utf-8", errors="ignore")
+        base = (REPO_ROOT / root).resolve()
+        if not base.exists():
+            return {"ok": True, "root": _safe_rel(base), "entries": []}
+
+        out = _list_tree(base, max_depth=max_depth)
+
+        if include_content:
+            MAX_INLINE = 64 * 1024
+            for e in out:
+                if e.get("type") == "file" and isinstance(e.get("size"), int) and e["size"] <= MAX_INLINE:
+                    ok, content, truncated, _size = _read_file(REPO_ROOT / e["path"], max_bytes=MAX_INLINE)
+                    if ok and content is not None and not truncated and not content.startswith("<<binary"):
+                        e["content"] = content
+        return {"ok": True, "root": _safe_rel(base), "entries": out}
+    except Exception as e:
+        return {"ok": False, "error": str(e)}
+
+
+def fs_glob(pattern: str, max_matches: int = 2000) -> Dict[str, Any]:
+    """
+    Glob for paths (relative to repo root). Returns a list of matches as strings.
+    """
+    try:
+        matches: List[str] = []
+        for p in REPO_ROOT.glob(pattern):
+            matches.append(_safe_rel(p))
+            if len(matches) >= max_matches:
+                break
+        return {"ok": True, "matches": matches}
+    except Exception as e:
+        return {"ok": False, "error": str(e)}
+
+
+def fs_read(path: str, max_bytes: int = 200_000) -> Dict[str, Any]:
+    """
+    Read up to max_bytes from a file (UTF-8). Binary files are marked and not decoded.
+    """
+    try:
+        fp = (REPO_ROOT / path).resolve()
+        ok, content, truncated, size = _read_file(fp, max_bytes=max_bytes)
+        if not ok:
+            return {"ok": False, "error": "File not found", "path": _safe_rel(fp)}
         return {
             "ok": True,
-            "path": str(p.relative_to(ROOT)),
-            "size": p.stat().st_size,
+            "path": _safe_rel(fp),
+            "size": size,
             "truncated": truncated,
-            "content": text,
+            "content": content,
         }
     except Exception as e:
-        return {"ok": False, "error": str(e)}
+        return {"ok": False, "error": str(e), "path": path}
 
 
-def fs_write(args: FSWriteArgs) -> Dict[str, Any]:
-    p = _safe_path(args.path)
+def fs_write(path: str, content: str, mode: str = "w") -> Dict[str, Any]:
+    """
+    Write text content to a file. Creates parent dirs as needed.
+    mode: "w" (overwrite) or "a" (append).
+    """
     try:
-        _ensure_parents(p)
-        if args.mode not in {"overwrite", "append"}:
-            args.mode = "overwrite"
-
-        if args.mode == "append" and p.exists():
-            prev = p.read_text(encoding="utf-8", errors="ignore")
-            new_content = prev + args.content
-        else:
-            new_content = args.content
-
-        p.write_text(new_content, encoding="utf-8")
-        return {"ok": True, "path": str(p.relative_to(ROOT)), "written_bytes": len(new_content)}
+        if mode not in {"w", "a"}:
+            return {"ok": False, "error": "Invalid mode (use 'w' or 'a')"}
+        fp = (REPO_ROOT / path).resolve()
+        _ensure_parent(fp)
+        with fp.open(mode, encoding="utf-8", newline="") as f:
+            f.write(content)
+        return {"ok": True, "path": _safe_rel(fp), "bytes": len(content)}
     except Exception as e:
-        return {"ok": False, "error": str(e)}
+        return {"ok": False, "error": str(e), "path": path}
 
 
-def fs_mkdir(args: FSMkdirArgs) -> Dict[str, Any]:
-    p = _safe_path(args.path)
+def fs_mkdir(path: str, exist_ok: bool = True, parents: bool = True) -> Dict[str, Any]:
+    """
+    Create a directory (and parents).
+    """
     try:
-        p.mkdir(parents=True, exist_ok=args.exist_ok)
-        return {"ok": True, "path": str(p.relative_to(ROOT))}
+        fp = (REPO_ROOT / path).resolve()
+        fp.mkdir(parents=parents, exist_ok=exist_ok)
+        return {"ok": True, "path": _safe_rel(fp)}
     except Exception as e:
-        return {"ok": False, "error": str(e)}
+        return {"ok": False, "error": str(e), "path": path}
 
 
-def fs_delete(args: FSDeleteArgs) -> Dict[str, Any]:
-    p = _safe_path(args.path)
-    rel = str(p.relative_to(ROOT))
-    if _is_forbidden(p):
-        return {"ok": False, "error": f"Refusing to delete protected path: {rel}"}
+def fs_delete(path: str, recursive: bool = True) -> Dict[str, Any]:
+    """
+    Delete a file or directory tree.
+    """
     try:
-        if not p.exists():
-            return {"ok": False, "error": "Path not found"}
-        if p.is_dir():
-            if args.recursive:
-                # Make writable, then remove
-                for sub in p.rglob("*"):
-                    try:
-                        os.chmod(sub, stat.S_IWRITE | stat.S_IREAD)
-                    except Exception:
-                        pass
-                shutil.rmtree(p)
+        fp = (REPO_ROOT / path).resolve()
+        if fp.is_dir():
+            if recursive:
+                shutil.rmtree(fp)
             else:
-                p.rmdir()
-            return {"ok": True, "path": rel, "deleted": True}
-        # file
-        p.unlink()
-        return {"ok": True, "path": rel, "deleted": True}
+                fp.rmdir()
+            return {"ok": True, "path": _safe_rel(fp), "type": "dir"}
+        elif fp.is_file():
+            fp.unlink()
+            return {"ok": True, "path": _safe_rel(fp), "type": "file"}
+        else:
+            return {"ok": True, "path": _safe_rel(fp), "type": "missing"}
     except Exception as e:
-        return {"ok": False, "error": str(e)}
+        return {"ok": False, "error": str(e), "path": path}
 
 
-def fs_diff(args: FSDiffArgs) -> Dict[str, Any]:
-    p = _safe_path(args.path)
-    old = ""
-    if p.exists() and p.is_file():
-        try:
-            old = p.read_text(encoding="utf-8", errors="ignore")
-        except Exception:
-            old = ""
-    diff = "\n".join(
-        unified_diff(
-            old.splitlines(),
-            args.new_content.splitlines(),
-            fromfile=str(p),
-            tofile=str(p),
-            lineterm="",
-        )
-    )
-    return {"ok": True, "path": str(p.relative_to(ROOT)), "diff": diff}
-
-
-def fs_patch(args: FSPatchArgs) -> Dict[str, Any]:
+def fs_diff(paths: Optional[List[str]] = None, unified: bool = True, max_bytes: int = 120_000) -> Dict[str, Any]:
     """
-    Apply a patch to a file.
-    - strategy="replace": treat `patch` as the entire new file body (recommended).
-    - strategy="unified": *best effort*; if parsing isn't confident, we fall back to replace.
+    Generate a quick, human-readable snapshot summary for given paths.
+    - Defaults to scoped roots ["backend", "workspace"] if paths is omitted.
+    - Skips heavy/noisy dirs and hidden dotfiles/dirs.
+    - Skips previews for binaries and anything > 48KB.
+    Not a VCS diff, but enough for post-edit visibility and for the agent's diff preview.
+
+    Returns keys 'unified', 'diff', and 'text' (same content) so downstream code
+    can find a diff-like string reliably.
     """
-    p = _safe_path(args.path)
     try:
-        _ensure_parents(p)
+        base = REPO_ROOT
+        targets: List[Path] = []
 
-        if args.strategy != "unified":
-            p.write_text(args.patch, encoding="utf-8")
-            return {"ok": True, "path": str(p.relative_to(ROOT)), "applied": "replace"}
+        # Default to scoped paths (avoid whole-repo scans)
+        scan_paths = paths or ["backend", "workspace"]
 
-        # Minimal unified support
-        lines = args.patch.splitlines()
-        plus: List[str] = []
-        in_hunk = False
-        for ln in lines:
-            if ln.startswith("@@"):
-                in_hunk = True
+        for p in scan_paths:
+            tp = (base / p).resolve()
+            if not tp.exists():
                 continue
-            if not in_hunk:
+            if tp.is_dir():
+                for sub in tp.rglob("*"):
+                    name = sub.name
+                    if name in _IGNORE_NAMES or name.startswith(_IGNORE_PREFIXES):
+                        continue
+                    if sub.is_file():
+                        targets.append(sub)
+            else:
+                targets.append(tp)
+
+        items: List[Dict[str, Any]] = []
+        total = 0
+        for fp in sorted(set(targets)):
+            try:
+                size = fp.stat().st_size
+                total += size
+                entry = {"path": _safe_rel(fp), "size": size}
+                # Small preview inline (skip binaries and >48KB)
+                if size <= 48_000 and fp.is_file():
+                    ok, content, truncated, _ = _read_file(fp, max_bytes=48_000)
+                    if ok and not truncated and content is not None and not content.startswith("<<binary"):
+                        entry["preview"] = content
+                items.append(entry)
+            except Exception:
+                # skip unreadable files
                 continue
-            if ln.startswith("+"):
-                plus.append(ln[1:])
-            elif ln.startswith(" ") or ln.startswith("-"):
-                # Can't guarantee correctness without a full patcher; bail to replace.
-                return _patch_fallback_replace(p, args.patch)
 
-        if plus:
-            content = "\n".join(plus) + ("\n" if args.patch.endswith("\n") else "")
-            p.write_text(content, encoding="utf-8")
-            return {"ok": True, "path": str(p.relative_to(ROOT)), "applied": "unified_plus_only"}
+        # Provide a unified "directory listing" style summary (not a VCS diff)
+        lines = [
+            "# Snapshot summary",
+            f"- Files counted: {len(items)}",
+            f"- Total bytes (approx): {total}",
+            "",
+        ]
+        for it in items[:200]:  # cap for size
+            lines.append(f"* {it['path']} ({it.get('size', '?')} bytes)")
+        summary = "\n".join(lines)
 
-        return _patch_fallback_replace(p, args.patch)
+        out = {
+            "ok": True,
+            "count": len(items),
+            "total_bytes": total,
+            "files": items[:500],
+            "summary": summary,
+        }
+        if unified:
+            out["unified"] = summary
+        # Ensure agent diff preview pick-up works:
+        out["diff"] = summary
+        out["text"] = summary
 
+        # Cap overall payload if necessary
+        blob = json.dumps(out, ensure_ascii=False)
+        if len(blob) > max_bytes:
+            trimmed = summary[-(max_bytes // 2):]
+            out["unified"] = trimmed
+            out["diff"] = trimmed
+            out["text"] = trimmed
+        return out
     except Exception as e:
         return {"ok": False, "error": str(e)}
 
 
-def _patch_fallback_replace(p: Path, patched: str) -> Dict[str, Any]:
-    p.write_text(patched, encoding="utf-8")
-    return {"ok": True, "path": str(p.relative_to(ROOT)), "applied": "fallback_replace"}
+def fs_patch(
+    path: str,
+    replacements: Optional[List[Dict[str, Any]]] = None,
+    create_if_missing: bool = True,
+    flags: Optional[List[str]] = None,
+) -> Dict[str, Any]:
+    """
+    Apply small, surgical regex replacements to a text file.
+
+    Args:
+      path: file to patch
+      replacements: list of { "pattern": str, "replacement": str, "count": int|None }
+        - 'pattern' is a Python regex (DOTALL by default via flags below)
+        - 'replacement' is the replacement string
+        - 'count' (optional) defaults to 0 (replace all)
+      create_if_missing: if True, will create an empty file before applying replacements
+      flags: optional list of flags ["IGNORECASE", "MULTILINE", "DOTALL", "UNICODE"]
+    """
+    try:
+        fp = (REPO_ROOT / path).resolve()
+        if not fp.exists():
+            if not create_if_missing:
+                return {"ok": False, "error": "File not found", "path": _safe_rel(fp)}
+            _ensure_parent(fp)
+            fp.write_text("", encoding="utf-8")
+
+        text_ok, content, _trunc, _size = _read_file(fp, max_bytes=2_000_000)
+        if not text_ok or content is None:
+            return {"ok": False, "error": "Cannot patch non-text or unreadable file", "path": _safe_rel(fp)}
+
+        current = content
+
+        flag_val = re.UNICODE | re.DOTALL  # good default for multi-line edits
+        if flags:
+            for f in flags:
+                name = f.upper().strip()
+                if hasattr(re, name):
+                    flag_val |= getattr(re, name)
+
+        total_edits = 0
+        if replacements:
+            for r in replacements:
+                pat = r.get("pattern", "")
+                repl = r.get("replacement", "")
+                count = int(r.get("count", 0))  # 0 = replace all
+                try:
+                    new_text, n = re.subn(pat, repl, current, count=count, flags=flag_val)
+                    if n > 0:
+                        total_edits += n
+                        current = new_text
+                except re.error as rex:
+                    return {"ok": False, "error": f"Regex error for pattern {pat!r}: {rex}", "path": _safe_rel(fp)}
+
+        changed = current != content
+        if changed:
+            fp.write_text(current, encoding="utf-8")
+
+        return {
+            "ok": True,
+            "path": _safe_rel(fp),
+            "changed": changed,
+            "edits": total_edits,
+            "bytes": fp.stat().st_size,
+        }
+    except Exception as e:
+        return {"ok": False, "error": str(e), "path": path}
 
 
-# --------------------------------------------------------------------------
-# OpenAI tool exposure
-# --------------------------------------------------------------------------
+# --------------------------------------------------------------------------------------
+# Tool registry & OpenAI tool specs
+# --------------------------------------------------------------------------------------
+
 @dataclass
-class _Tool:
+class Tool:
     name: str
     description: str
     parameters: Dict[str, Any]
-    fn: Any
+    func: Callable[..., Dict[str, Any]]
 
 
-_TOOLS: List[_Tool] = [
-    _Tool(
+_TOOLS: List[Tool] = [
+    Tool(
         name="fs_map",
         description="List files/folders under a path (relative to repo root). Use to explore before editing.",
-        parameters=FSMapArgs.model_json_schema(),
-        fn=lambda **kw: fs_map(FSMapArgs.model_validate(kw)),
+        parameters={
+            "type": "object",
+            "title": "FSMapArgs",
+            "properties": {
+                "root": {"type": "string", "title": "Root", "description": "Directory to scan (relative to repo root)", "default": "."},
+                "max_depth": {"type": "integer", "title": "Max Depth", "minimum": 0, "maximum": 10, "default": 4},
+                "include_content": {"type": "boolean", "title": "Include Content", "description": "Include file content when size <= 64KB", "default": False},
+            },
+        },
+        func=fs_map,
     ),
-    _Tool(
+    Tool(
         name="fs_glob",
-        description="Glob files from repo root (supports **). Returns relative paths.",
-        parameters=FSGlobArgs.model_json_schema(),
-        fn=lambda **kw: fs_glob(FSGlobArgs.model_validate(kw)),
+        description="Glob for paths relative to repo root. Returns a list of matches.",
+        parameters={
+            "type": "object",
+            "title": "FSGlobArgs",
+            "properties": {
+                "pattern": {"type": "string", "title": "Pattern"},
+                "max_matches": {"type": "integer", "title": "Max Matches", "default": 2000},
+            },
+            "required": ["pattern"],
+        },
+        func=fs_glob,
     ),
-    _Tool(
+    Tool(
         name="fs_read",
-        description="Read a UTF-8 text file (size-guarded).",
-        parameters=FSReadArgs.model_json_schema(),
-        fn=lambda **kw: fs_read(FSReadArgs.model_validate(kw)),
+        description="Read up to max_bytes from a file (UTF-8). Binary files are marked.",
+        parameters={
+            "type": "object",
+            "title": "FSReadArgs",
+            "properties": {
+                "path": {"type": "string", "title": "Path"},
+                "max_bytes": {"type": "integer", "title": "Max Bytes", "default": 200000},
+            },
+            "required": ["path"],
+        },
+        func=fs_read,
     ),
-    _Tool(
+    Tool(
         name="fs_write",
-        description="Write/overwrite or append text to a file. Creates parent dirs.",
-        parameters=FSWriteArgs.model_json_schema(),
-        fn=lambda **kw: fs_write(FSWriteArgs.model_validate(kw)),
+        description="Write text content to a file. Creates parent dirs if needed. mode: 'w' overwrite or 'a' append.",
+        parameters={
+            "type": "object",
+            "title": "FSWriteArgs",
+            "properties": {
+                "path": {"type": "string", "title": "Path"},
+                "content": {"type": "string", "title": "Content"},
+                "mode": {"type": "string", "title": "Mode", "enum": ["w", "a"], "default": "w"},
+            },
+            "required": ["path", "content"],
+        },
+        func=fs_write,
     ),
-    _Tool(
+    Tool(
         name="fs_mkdir",
-        description="Create a directory (parents ok).",
-        parameters=FSMkdirArgs.model_json_schema(),
-        fn=lambda **kw: fs_mkdir(FSMkdirArgs.model_validate(kw)),
+        description="Create a directory (and parents).",
+        parameters={
+            "type": "object",
+            "title": "FSMkdirArgs",
+            "properties": {
+                "path": {"type": "string", "title": "Path"},
+                "exist_ok": {"type": "boolean", "title": "Exist OK", "default": True},
+                "parents": {"type": "boolean", "title": "Parents", "default": True},
+            },
+            "required": ["path"],
+        },
+        func=fs_mkdir,
     ),
-    _Tool(
+    Tool(
         name="fs_delete",
-        description="Delete a file or directory. Set recursive=true for recursive removal (protected paths refused).",
-        parameters=FSDeleteArgs.model_json_schema(),
-        fn=lambda **kw: fs_delete(FSDeleteArgs.model_validate(kw)),
+        description="Delete a file or directory tree.",
+        parameters={
+            "type": "object",
+            "title": "FSDeleteArgs",
+            "properties": {
+                "path": {"type": "string", "title": "Path"},
+                "recursive": {"type": "boolean", "title": "Recursive", "default": True},
+            },
+            "required": ["path"],
+        },
+        func=fs_delete,
     ),
-    _Tool(
+    Tool(
         name="fs_diff",
-        description="Unified diff between current file content and proposed new content.",
-        parameters=FSDiffArgs.model_json_schema(),
-        fn=lambda **kw: fs_diff(FSDiffArgs.model_validate(kw)),
+        description="Summarize current repo snapshot or specific paths. Returns a readable summary and per-file previews.",
+        parameters={
+            "type": "object",
+            "title": "FSDiffArgs",
+            "properties": {
+                "paths": {
+                    "type": "array",
+                    "title": "Paths",
+                    "items": {"type": "string"},
+                    "description": "Specific files/dirs to include. If omitted, scans ['backend','workspace'].",
+                },
+                "unified": {"type": "boolean", "title": "Unified", "default": True},
+                "max_bytes": {"type": "integer", "title": "Max Bytes", "default": 120000},
+            },
+        },
+        func=fs_diff,
     ),
-    _Tool(
+    Tool(
         name="fs_patch",
-        description="Apply a patch. Prefer strategy='replace' where `patch` is the full new content.",
-        parameters=FSPatchArgs.model_json_schema(),
-        fn=lambda **kw: fs_patch(FSPatchArgs.model_validate(kw)),
+        description="Apply small regex-based edits to a text file. Safer than wholesale rewrites.",
+        parameters={
+            "type": "object",
+            "title": "FSPatchArgs",
+            "properties": {
+                "path": {"type": "string", "title": "Path"},
+                "replacements": {
+                    "type": "array",
+                    "title": "Replacements",
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "pattern": {"type": "string", "title": "Pattern"},
+                            "replacement": {"type": "string", "title": "Replacement"},
+                            "count": {"type": "integer", "title": "Count", "description": "0 = replace all", "default": 0},
+                        },
+                        "required": ["pattern", "replacement"],
+                    },
+                    "description": "List of regex replacements to apply in order.",
+                },
+                "create_if_missing": {"type": "boolean", "title": "Create If Missing", "default": True},
+                "flags": {
+                    "type": "array",
+                    "title": "Flags",
+                    "items": {"type": "string", "enum": ["IGNORECASE", "MULTILINE", "DOTALL", "UNICODE"]},
+                },
+            },
+            "required": ["path"],
+        },
+        func=fs_patch,
     ),
 ]
 
 
 def openai_tool_specs() -> List[dict]:
     """
-    Return tool definitions for the OpenAI Responses API using the **flat schema**
-    expected by your installed SDK: {"type":"function","name":...,"description":...,"parameters":...}
+    Return tools in the exact shape OpenAI's Responses / Chat Completions
+    APIs expect: {"type": "function", "function": {...}}.
     """
     return [
         {
             "type": "function",
-            "name": t.name,
-            "description": t.description,
-            "parameters": t.parameters,
+            "function": {
+                "name": t.name,
+                "description": t.description,
+                "parameters": t.parameters,
+            },
         }
         for t in _TOOLS
     ]
 
 
-def dispatch_tool_call(name: str, arguments: dict) -> Dict[str, Any]:
+def dispatch_tool_call(name: str, arguments: Optional[Dict[str, Any]]) -> Dict[str, Any]:
     """
-    Executes a tool call by name with validated arguments.
+    Dispatch a tool by name with provided arguments. Always returns a JSON-serializable dict.
     """
+    arguments = arguments or {}
     tool = next((t for t in _TOOLS if t.name == name), None)
     if not tool:
         return {"ok": False, "error": f"Unknown tool: {name}"}
+
     try:
-        return tool.fn(**(arguments or {}))
+        return tool.func(**arguments)
+    except TypeError as te:
+        # Helpful error when schema mismatches runtime kwargs
+        return {"ok": False, "error": f"Invalid arguments for {name}: {te}", "arguments": arguments}
     except Exception as e:
         return {"ok": False, "error": str(e)}
