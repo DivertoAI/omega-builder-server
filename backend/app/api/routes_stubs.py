@@ -176,10 +176,10 @@ async def list_stubs(
     env: Optional[str] = Query(default=None, description="Environment filter"),
     tag: Optional[str] = Query(default=None, description="Require this tag"),
     enabled: Optional[bool] = Query(default=None, description="Filter by enabled flag"),
+    sort: Optional[str] = Query(default=None, description="Sort by 'env','path','name' (comma-separated, prefix '-' for desc)"),
+    offset: int = Query(default=0, ge=0),
+    limit: int = Query(default=100, ge=1, le=500),
 ) -> List[Dict[str, Any]]:
-    """
-    List stubs with simple filters.
-    """
     stubs = _load_stubs()
     items = list(stubs.values())
 
@@ -193,9 +193,37 @@ async def list_stubs(
     if enabled is not None:
         items = [s for s in items if bool(s.get("enabled")) == bool(enabled)]
 
-    # stable sort by env, path
-    items.sort(key=lambda s: (s.get("env", ""), s.get("path", "")))
-    return items
+    # default stable sort (env, path) if no custom sort requested
+    if sort:
+        keys = []
+        for token in (sort.split(",") if isinstance(sort, str) else []):
+            token = token.strip()
+            if not token:
+                continue
+            desc = token.startswith("-")
+            key = token[1:] if desc else token
+            if key not in {"env", "path", "name"}:
+                continue
+            keys.append((key, desc))
+
+        def _composite_key(s):
+            out = []
+            for k, desc in keys:
+                val = s.get(k, "")
+                # invert for desc via tuple trick
+                out.append((val, desc))
+            return tuple((v if not d else ("" if v is None else v)) for v, d in out)
+
+        # Since Python can't sort with mixed asc/desc in one pass without complex keys,
+        # we apply stable sorts in reverse order of keys.
+        for k, desc in reversed(keys):
+            items.sort(key=lambda s: s.get(k, ""), reverse=desc)
+    else:
+        items.sort(key=lambda s: (s.get("env", ""), s.get("path", "")))
+
+    # pagination
+    end = offset + limit
+    return items[offset:end]
 
 @router.post("/stubs", status_code=201)
 async def create_stub(payload: Dict[str, Any] = Body(...)) -> Dict[str, Any]:
@@ -407,3 +435,39 @@ async def delete_stub(stub_id: str = PathParam(...)) -> Response:
     stubs.pop(stub_id, None)
     _save_stubs(stubs)
     return Response(status_code=204)
+
+
+@router.post("/stubs/{stub_id}/tags")
+async def add_tags_to_stub(stub_id: str = PathParam(...), payload: Dict[str, Any] = Body(...)) -> Dict[str, Any]:
+    tags = _validate_tags(payload.get("tags"))
+    stubs = _load_stubs()
+    stub = stubs.get(stub_id)
+    if not stub:
+        raise HTTPException(status_code=404, detail="Stub not found")
+    current = _validate_tags(stub.get("tags", []))
+    merged = []
+    seen = set()
+    for t in current + tags:
+        if t not in seen:
+            merged.append(t)
+            seen.add(t)
+    stub["tags"] = merged
+    stubs[stub_id] = stub
+    _save_stubs(stubs)
+    _ensure_tags_exist(merged)
+    return {"updated": True, "id": stub_id, "tags": merged}
+
+@router.delete("/stubs/{stub_id}/tags/{tag}", status_code=200)
+async def remove_tag_from_stub(stub_id: str = PathParam(...), tag: str = PathParam(...)) -> Dict[str, Any]:
+    tag = (tag or "").strip()
+    if not tag:
+        raise HTTPException(status_code=400, detail="invalid tag")
+    stubs = _load_stubs()
+    stub = stubs.get(stub_id)
+    if not stub:
+        raise HTTPException(status_code=404, detail="Stub not found")
+    cur = [t for t in _validate_tags(stub.get("tags", [])) if t != tag]
+    stub["tags"] = cur
+    stubs[stub_id] = stub
+    _save_stubs(stubs)
+    return {"updated": True, "id": stub_id, "tags": cur}
