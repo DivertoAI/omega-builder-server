@@ -27,4 +27,5 @@ workspace/
 
 # IDE
 .vscode/
-.idea/
+.idea/**/.DS_Store
+**/._*

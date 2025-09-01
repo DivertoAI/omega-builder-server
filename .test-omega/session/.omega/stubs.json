@@ -1,0 +1,10 @@
+{
+  "31ef2346-78e4-4ae2-b9ad-23810aec343f": {
+    "id": "31ef2346-78e4-4ae2-b9ad-23810aec343f",
+    "name": "check",
+    "path": "/hello",
+    "env": "default",
+    "enabled": true,
+    "tags": []
+  }
+}
