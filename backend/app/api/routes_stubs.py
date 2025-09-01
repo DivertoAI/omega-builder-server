@@ -1,3 +1,4 @@
+# backend/app/api/routes_stubs.py
 from __future__ import annotations
 
 import json
@@ -13,8 +14,11 @@ from fastapi import APIRouter, Body, HTTPException, Path as PathParam, Query, Re
 router = APIRouter(prefix="/api", tags=["stubs"])
 
 # -----------------------------------------------------------------------------
-# Store location & per-test isolation (pytest)
+# Store location & per-test isolation (pytest) - integrates with stubs_store
 # -----------------------------------------------------------------------------
+
+# Tracks which omega dirs we've already wiped this test run (prevents repeat deletes)
+_WIPED_OMEGA_DIRS: set[Path] = set()
 
 def _is_pytest() -> bool:
     return (
@@ -26,7 +30,7 @@ def _is_pytest() -> bool:
 def _pytest_nodeid_fragment() -> str:
     """
     Stable per-test fragment from PYTEST_CURRENT_TEST (nodeid is first token before a space).
-    We sanitize / and os.sep so we can safely use it in a folder path.
+    We sanitize path separators; keep other chars (like '::') which are valid on POSIX.
     """
     nodeid = os.environ.get("PYTEST_CURRENT_TEST", "").split(" ")[0]
     if not nodeid:
@@ -34,22 +38,43 @@ def _pytest_nodeid_fragment() -> str:
     frag = nodeid.replace("/", "_").replace(os.sep, "_")
     return frag or "session"
 
+def _workspace_from_stubs_store() -> Optional[Path]:
+    """
+    Try to get a canonical workspace base path from services.stubs_store.
+    """
+    try:
+        from backend.app.services.stubs_store import _workspace_from_env as _ws  # type: ignore
+        return Path(_ws())
+    except Exception:
+        try:
+            from backend.app.services.stubs_store import get_store  # type: ignore
+            store = get_store()
+            root = getattr(store, "root", None) or getattr(store, "path", None) or getattr(store, "workspace", None)
+            if root:
+                return Path(root)
+        except Exception:
+            pass
+    return None
+
 def _store_root() -> Path:
     """
     Store root:
-      - If OMEGA_STORE_DIR is set, use it.
-      - If under pytest, use a *per-test* isolated directory based on nodeid.
-      - Otherwise default to workspace/.omega.
+      - OMEGA_STORE_DIR if set
+      - else stubs_store workspace if available
+      - if under pytest, use per-test isolated folder under .test-omega/<nodeid>/.omega
+      - else default to workspace/.omega
     """
-    if "OMEGA_STORE_DIR" in os.environ and os.environ["OMEGA_STORE_DIR"].strip():
-        return Path(os.environ["OMEGA_STORE_DIR"]).expanduser().resolve()
+    env_dir = os.environ.get("OMEGA_STORE_DIR", "").strip()
+    if env_dir:
+        return Path(env_dir).expanduser().resolve()
+
+    base = _workspace_from_stubs_store() or Path("workspace/.omega")
 
     if _is_pytest():
         frag = _pytest_nodeid_fragment()
-        # Each test gets its own isolated dir, ensuring clean slate expectations.
         return Path(".test-omega") / frag / ".omega"
 
-    return Path("workspace/.omega")
+    return base
 
 def _omega_dir() -> Path:
     return _store_root()
@@ -61,28 +86,17 @@ def _tags_path() -> Path:
     return _omega_dir() / "tags.json"
 
 def _ensure_store() -> None:
-    _omega_dir().mkdir(parents=True, exist_ok=True)
-
-def _wipe_store_dir_if_needed_once_per_test() -> None:
     """
-    For pytest: ensure the per-test dir is clean the first time it's touched.
-    Because the directory includes the nodeid fragment, each test naturally
-    gets a new folder; we still remove it if it already exists to be safe.
+    Ensure the store dir exists. When running under pytest, wipe the *current test's*
+    omega dir once on first touch to guarantee a clean slate per test function.
     """
-    if not _is_pytest():
-        return
     root = _omega_dir()
-    try:
+    # First-touch wipe for this test's dir
+    if _is_pytest() and root not in _WIPED_OMEGA_DIRS:
         if root.exists():
             shutil.rmtree(root, ignore_errors=True)
-    except Exception:
-        pass
+        _WIPED_OMEGA_DIRS.add(root)
     root.mkdir(parents=True, exist_ok=True)
-
-# We don’t want to wipe in normal runtime.
-# For pytest, do one wipe at import for the *current* nodeid (first touched test).
-if _is_pytest():
-    _wipe_store_dir_if_needed_once_per_test()
 
 def _load_json(path: Path, default):
     try:
@@ -103,12 +117,14 @@ def _save_json(path: Path, data) -> None:
 # stubs.json shape: { "<id>": {id, name, path, env, enabled, tags: []} }
 
 def _load_stubs() -> Dict[str, Dict[str, Any]]:
+    _ensure_store()
     return _load_json(_stubs_path(), default={})
 
 def _save_stubs(stubs: Dict[str, Dict[str, Any]]) -> None:
     _save_json(_stubs_path(), stubs)
 
 def _load_tags() -> List[str]:
+    _ensure_store()
     tags: List[str] = _load_json(_tags_path(), default=[])
     # de-dup and normalize
     uniq = sorted({t.strip() for t in tags if isinstance(t, str) and t.strip()})
@@ -193,35 +209,16 @@ async def list_stubs(
     if enabled is not None:
         items = [s for s in items if bool(s.get("enabled")) == bool(enabled)]
 
-    # default stable sort (env, path) if no custom sort requested
     if sort:
-        keys = []
-        for token in (sort.split(",") if isinstance(sort, str) else []):
-            token = token.strip()
-            if not token:
-                continue
+        for token in reversed([t.strip() for t in sort.split(",") if t.strip()]):
             desc = token.startswith("-")
             key = token[1:] if desc else token
             if key not in {"env", "path", "name"}:
                 continue
-            keys.append((key, desc))
-
-        def _composite_key(s):
-            out = []
-            for k, desc in keys:
-                val = s.get(k, "")
-                # invert for desc via tuple trick
-                out.append((val, desc))
-            return tuple((v if not d else ("" if v is None else v)) for v, d in out)
-
-        # Since Python can't sort with mixed asc/desc in one pass without complex keys,
-        # we apply stable sorts in reverse order of keys.
-        for k, desc in reversed(keys):
-            items.sort(key=lambda s: s.get(k, ""), reverse=desc)
+            items.sort(key=lambda s: s.get(key, ""), reverse=desc)
     else:
         items.sort(key=lambda s: (s.get("env", ""), s.get("path", "")))
 
-    # pagination
     end = offset + limit
     return items[offset:end]
 
@@ -229,9 +226,7 @@ async def list_stubs(
 async def create_stub(payload: Dict[str, Any] = Body(...)) -> Dict[str, Any]:
     """
     Create a stub with unique (env, path).
-
-    Body:
-      { "name": str, "path": "/hello", "env": "default", "enabled": true?, "tags": [str]? }
+    Body: { "name": str, "path": "/hello", "env": "default", "enabled": true?, "tags": [str]? }
     """
     name = payload.get("name")
     path = payload.get("path")
@@ -264,26 +259,17 @@ async def create_stub(payload: Dict[str, Any] = Body(...)) -> Dict[str, Any]:
     return stub
 
 # -----------------------------------------------------------------------------
-# Import / Export (register BEFORE dynamic '/stubs/{stub_id}' route)
+# Import / Export
 # -----------------------------------------------------------------------------
 
 @router.get("/stubs/export")
 async def export_stubs() -> Dict[str, Any]:
-    """
-    Export all stubs.
-
-    Response:
-      { "stubs": [...], "count": <int> }
-    """
     stubs = _load_stubs()
     items = [stubs[k] for k in sorted(stubs.keys())]
     return {"stubs": items, "count": len(items)}
 
 @router.post("/stubs/import")
 async def import_stubs(payload: Dict[str, Any] = Body(...)) -> Dict[str, Any]:
-    """
-    Import stubs (merge or replace).
-    """
     incoming = payload.get("stubs")
     mode = (payload.get("mode") or "merge").lower()
     if not isinstance(incoming, list):
@@ -291,14 +277,11 @@ async def import_stubs(payload: Dict[str, Any] = Body(...)) -> Dict[str, Any]:
     if mode not in {"merge", "replace"}:
         raise HTTPException(status_code=400, detail="mode must be 'merge' or 'replace'")
 
-    # Start from existing or empty depending on mode
     stubs = {} if mode == "replace" else _load_stubs()
 
     imported = 0
     skipped_conflicts = 0
     added_tags: List[str] = []
-
-    # Track seen (env, path) in this run to prevent duplicates in same payload
     seen_pairs = {(s["env"], s["path"]) for s in stubs.values() if "env" in s and "path" in s}
 
     for raw in incoming:
@@ -312,7 +295,6 @@ async def import_stubs(payload: Dict[str, Any] = Body(...)) -> Dict[str, Any]:
         enabled = bool(raw.get("enabled", True))
         tags = _validate_tags(raw.get("tags"))
 
-        # basic validation
         if not isinstance(name, str) or not name.strip():
             skipped_conflicts += 1
             continue
@@ -320,12 +302,10 @@ async def import_stubs(payload: Dict[str, Any] = Body(...)) -> Dict[str, Any]:
             skipped_conflicts += 1
             continue
 
-        # uniqueness on (env, path)
         if (env, path) in seen_pairs:
             skipped_conflicts += 1
             continue
 
-        # ok to create
         sid = str(uuid.uuid4())
         stub = {
             "id": sid,
@@ -352,7 +332,7 @@ async def import_stubs(payload: Dict[str, Any] = Body(...)) -> Dict[str, Any]:
     }
 
 # -----------------------------------------------------------------------------
-# Dynamic item routes (after static export/import to avoid shadowing)
+# Dynamic item routes
 # -----------------------------------------------------------------------------
 
 @router.get("/stubs/{stub_id}")
@@ -368,9 +348,6 @@ async def update_stub(
     stub_id: str = PathParam(...),
     payload: Dict[str, Any] = Body(...),
 ) -> Dict[str, Any]:
-    """
-    Update fields; supports: name, path, env, enabled, tags
-    """
     stubs = _load_stubs()
     stub = stubs.get(stub_id)
     if not stub:
@@ -399,7 +376,6 @@ async def update_stub(
             raise HTTPException(status_code=400, detail="invalid path (must start with '/')")
         new_path = pth
 
-    # enforce unique (env, path) if either changed
     if new_env != stub["env"] or new_path != stub["path"]:
         _check_unique_path(stubs, new_env, new_path, exclude_id=stub_id)
         stub["env"] = new_env
@@ -426,16 +402,12 @@ async def update_stub(
 
 @router.delete("/stubs/{stub_id}", status_code=204)
 async def delete_stub(stub_id: str = PathParam(...)) -> Response:
-    """
-    Delete a stub. Returns 204 No Content on success.
-    """
     stubs = _load_stubs()
     if stub_id not in stubs:
         raise HTTPException(status_code=404, detail="Stub not found")
     stubs.pop(stub_id, None)
     _save_stubs(stubs)
     return Response(status_code=204)
-
 
 @router.post("/stubs/{stub_id}/tags")
 async def add_tags_to_stub(stub_id: str = PathParam(...), payload: Dict[str, Any] = Body(...)) -> Dict[str, Any]:

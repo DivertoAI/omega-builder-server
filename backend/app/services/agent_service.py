@@ -5,7 +5,7 @@ import asyncio
 import random
 import time
 from pathlib import Path
-from typing import Dict, Any, List, Optional, Iterable, Set
+from typing import Dict, Any, List, Optional, Iterable, Set, Tuple
 
 from backend.app.core.config import settings
 from backend.app.core.progress import start_job
@@ -21,27 +21,51 @@ LAST_RUN_PATH = OMEGA_DIR / "last_run.json"
 SYSTEM = """You are Omega Builder Agent.
 
 Goal:
-- Adapt this repository to implement/reflect the provided OmegaSpec.
+- Produce a runnable, no-build web application (plain HTML/CSS/JS) that fulfills the provided OmegaSpec or brief.
 
 Hard rules:
-- DO NOT create placeholder mocks or fake assets.
-- Use only the provided filesystem tools: fs_map, fs_glob, fs_read, fs_write, fs_mkdir, fs_delete, fs_diff, fs_patch.
-- Prefer minimal, incremental edits that make the app skeleton reflect the spec (routes, stubs, TODOs).
-- Keep changes self-contained and compile-friendly; add TODO comments instead of stubbing external deps.
-- Maintain idempotency: reruns must not duplicate content.
-- When you need repo context, CALL TOOLS. Do not guess file contents.
+- Do NOT emit placeholder scaffolds. Deliver working pages, real UI, and real logic.
+- Use only the filesystem tools: fs_map, fs_glob, fs_read, fs_write, fs_mkdir, fs_delete, fs_diff, fs_patch.
+- Prefer minimal, incremental, idempotent edits: if re-run, patch/replace the same managed blocks without duplicating.
+- Keep the app runnable with zero tooling: no bundlers, no frameworks. Only index.html, styles.css, main.js.
+- Persist client-side state locally (e.g., localStorage) when the brief implies persistence.
+- Before writing, fs_read existing files to avoid duplicates. Use fs_patch for surgical edits. After edits, run fs_diff.
 
-Mini playbook (very important):
-- Before writing to a file: fs_read it to see current content.
-- Prefer fs_patch for small or surgical changes; use fs_write for whole-file writes only when needed.
-- After any write/patch sequence, run fs_diff to inspect the changes you just made.
-- Always FINISH by:
-  1) Running fs_glob on a few expected paths to verify outputs exist (e.g., main routes, workspace docs).
-  2) Running fs_diff to emit a final repo diff.
-- Never duplicate content on reruns; replace/patch the same managed blocks instead.
+Completion requirements (mandatory):
+1) The app lives under workspace/apps/<slug>/ (slugify the spec/brief name).
+2) At minimum, create:
+   - index.html  (real UI that actually performs the requested tasks)
+   - styles.css  (styling consistent with the brief, e.g., dark theme)
+   - main.js     (actual behavior; no placeholders)
+3) Verify with:
+   - fs_glob on workspace/apps/<slug>/*
+   - fs_read on index.html, styles.css, main.js to ensure they are non-empty and coherent
+   - fs_diff to show the final changes
+4) When you’re finished, reply with a short plain-text summary starting with: DONE:
+"""
 
-Completion:
-- When you believe you’re done, reply with a short plain-text summary starting with: DONE:
+KICKOFF_INSTRUCTION = """Plan your edits first, then create a runnable app under workspace/apps/<slug>/.
+
+Initial repo inspection:
+- Call fs_glob on: "backend/**/*.py", "workspace/**/*", "assets/**/*", "pyproject.toml", "README.md".
+- fs_read any file you intend to modify before writing.
+
+Implementation order:
+1) Determine <slug> from the spec/brief title (e.g., "todo" for a Todo app).
+2) Ensure directory exists: workspace/apps/<slug> (fs_mkdir if missing).
+3) Create real, working files:
+   - index.html: Proper HTML structure, visible UI matching the brief, link styles.css and main.js.
+   - styles.css: Real styles (e.g., dark theme when requested).
+   - main.js: Actual logic (CRUD/state/events). Use localStorage if persistence is implied.
+4) Idempotency: if files exist, use fs_read + fs_patch to update relevant sections without duplication.
+
+Verification and finish:
+- fs_glob workspace/apps/<slug>/*
+- fs_read index.html, styles.css, main.js (ensure non-empty and coherent)
+- fs_diff on workspace/apps/<slug>
+- Then emit a DONE: summary.
+
+Never output placeholder scaffolds; always produce a runnable app.
 """
 
 USER_PREFIX = """Repository context:
@@ -189,6 +213,45 @@ def _persist_last_run(payload: Dict[str, Any]) -> None:
         pass
 
 
+# ---------------------------- progress helpers ----------------------------
+
+class _Pbar:
+    """
+    Simple progress allocator across phases:
+      boot:         0.00 - 0.12
+      agent loop:   0.12 - 0.92
+      finalization: 0.92 - 0.98
+      wrap-up:      0.98 - 1.00
+    """
+
+    def __init__(self, publish):
+        self.publish = publish
+        self.cur = 0.0
+
+    async def set(self, value: float, event: str, data: Optional[dict] = None) -> None:
+        value = max(0.0, min(1.0, value))
+        if value > self.cur + 0.0001:  # avoid spam
+            self.cur = value
+        try:
+            await self.publish(event, data=data or {}, progress=self.cur)
+        except Exception:
+            # never fail the run due to SSE hiccups
+            pass
+
+    async def bump(self, delta: float, event: str, data: Optional[dict] = None) -> None:
+        await self.set(self.cur + delta, event, data)
+
+
+def _loop_progress_fn(steps: int) -> Tuple[float, float]:
+    """
+    Return (base, per_step) allocation for the agent loop range 0.12..0.92 (~80%).
+    """
+    start, end = 0.12, 0.92
+    total = end - start
+    per_step = total / max(steps, 1)
+    return start, per_step
+
+
 # ---------------------------- main loop ----------------------------
 
 async def adapt_repository_with_agent(
@@ -227,16 +290,19 @@ async def adapt_repository_with_agent(
 
     async with start_job("generate", data={"mode": "agent"}) as (job_id, publish):
         job_id_seen = job_id
-        await publish("agent_boot", progress=0.05)
+        pbar = _Pbar(publish)
 
-        # Helpful telemetry
+        # --- Boot / setup (0.00 → 0.12)
+        await pbar.set(0.02, "agent_job_started", {"job_id": job_id})
+        await pbar.set(0.05, "agent_boot")
         try:
             first_tool = tools[0] if tools else {}
-            await publish("agent_tool_shape", data={"tool0": first_tool}, progress=0.06)
-            await publish("agent_bootstrap", data={"count": len(tools)}, progress=0.12)
+            await pbar.set(0.06, "agent_tool_shape", {"tool0": first_tool})
+            await pbar.set(0.10, "agent_bootstrap", {"count": len(tools)})
             await _warn_if_missing_tools(publish, tools, required=("fs_diff", "fs_patch"))
         except Exception:
             pass
+        await pbar.set(0.12, "agent_ready")
 
         # Seed conversation
         messages: List[dict] = [
@@ -255,20 +321,19 @@ async def adapt_repository_with_agent(
         # Budget tracking
         deadline = time.monotonic() + budget
 
-        # Always-finalize block
+        # --- Agent loop (0.12 → 0.92)
+        loop_steps = 13  # bounded for safety
+        base, per_step = _loop_progress_fn(loop_steps)
+
         try:
-            # bounded loop for safety
-            for step in range(1, 14):
-                # Budget check before making another turn
+            for step in range(1, loop_steps + 1):
                 remaining = _sec_remaining(deadline)
                 if remaining <= 0.0:
-                    try:
-                        await publish("agent_budget_exhausted", data={"at_step": step}, progress=0.93)
-                    except Exception:
-                        pass
+                    await pbar.set(0.93, "agent_budget_exhausted", {"at_step": step})
                     break
 
-                await publish(f"agent_step_{step}", progress=min(0.14 + step * 0.06, 0.92))
+                # Small pre-step nudge so UI moves before the model call
+                await pbar.set(min(base + (step - 1) * per_step + 0.01, 0.90), "agent_step_enter", {"step": step})
 
                 create_kwargs: Dict[str, Any] = {
                     "model": settings.omega_llm_model,
@@ -277,7 +342,6 @@ async def adapt_repository_with_agent(
                     "tool_choice": "auto",
                 }
 
-                # Per-call timeout can't exceed remaining wall-clock by too much
                 per_turn_budget = max(1.0, min(turn_timeout, max(1.0, remaining - 1.0)))
 
                 try:
@@ -286,7 +350,6 @@ async def adapt_repository_with_agent(
                         timeout=per_turn_budget,
                     )
                 except asyncio.TimeoutError:
-                    # Record timeout and stop the loop; finalization will still run.
                     tool_log.append(
                         {
                             "name": "model_call_timeout",
@@ -294,20 +357,18 @@ async def adapt_repository_with_agent(
                             "result": {"ok": False, "error": "chat.completions timeout"},
                         }
                     )
-                    try:
-                        await publish("agent_turn_timeout", data={"step": step, "timeout_sec": per_turn_budget})
-                    except Exception:
-                        pass
+                    await pbar.bump(0.005, "agent_turn_timeout", {"step": step, "timeout_sec": per_turn_budget})
                     break
 
                 assistant_msg = resp.choices[0].message
-
-                # Record assistant message
                 assistant_dict = _assistant_message_to_dict(assistant_msg)
                 messages.append(assistant_dict)
 
-                # Execute tool calls (if any) — reply with a single tool result message per tool_call_id
+                # Execute tool calls (if any)
                 if assistant_dict.get("tool_calls"):
+                    # Progress slice for this step
+                    # We’ll distribute a few tiny bumps within the step while tools run
+                    in_step_bump = min(per_step * 0.6, 0.03)  # cap per tool-burst bump
                     for tc in assistant_dict["tool_calls"]:
                         name = tc["function"]["name"]
                         raw_args = tc["function"].get("arguments") or "{}"
@@ -316,7 +377,6 @@ async def adapt_repository_with_agent(
                         except Exception:
                             args = {}
 
-                        # Run (or skip) tool
                         if validate_only and name in WRITEY:
                             result = {
                                 "ok": True,
@@ -331,18 +391,13 @@ async def adapt_repository_with_agent(
                         tool_log.append({"name": name, "args": args, "result": result})
 
                         short_path = args.get("path") or args.get("root") or args.get("pattern") or ""
-                        try:
-                            await publish("agent_tool_result", data={"tool": name, "path": short_path})
-                        except Exception:
-                            pass
+                        await pbar.bump(in_step_bump, "agent_tool_result", {"tool": name, "path": short_path})
 
-                        # Track touched paths for summary
                         if (not validate_only) and name in WRITEY:
                             p = args.get("path") or args.get("pattern") or args.get("root")
                             if isinstance(p, str) and p:
                                 touched_paths.append(p)
 
-                        # Link result back with tool_call_id
                         messages.append(
                             {
                                 "role": "tool",
@@ -350,25 +405,29 @@ async def adapt_repository_with_agent(
                                 "content": json.dumps(result, ensure_ascii=False),
                             }
                         )
-                    # Let the model react to tool outputs
+
+                    # Nudge at end of tools for this step
+                    await pbar.set(min(base + step * per_step, 0.92), "agent_step_done", {"step": step})
+                    # Let model react to tools next turn
                     continue
 
                 # No tool calls; check for DONE sentinel
                 text_out: str = assistant_dict.get("content") or ""
                 if isinstance(text_out, str) and text_out.strip().upper().startswith("DONE:"):
+                    await pbar.set(0.92, "agent_declared_done", {"step": step})
                     break
 
+                # If model produced plain text but not DONE, advance a little
+                await pbar.bump(min(per_step * 0.3, 0.02), "agent_text_only", {"step": step})
+
         finally:
-            # ---------------- Forced Finalization ----------------
+            # --- Finalization (0.92 → 0.98)
             # Quick existence checks (non-fatal)
             for pat in ("workspace/**/*", "backend/**/*.py"):
                 try:
                     res = dispatch_tool_call("fs_glob", {"pattern": pat, "max_matches": 2000})
                     tool_log.append({"name": "fs_glob", "args": {"pattern": pat, "max_matches": 2000}, "result": res})
-                    try:
-                        await publish("agent_tool_result", data={"tool": "fs_glob", "path": pat})
-                    except Exception:
-                        pass
+                    await pbar.bump(0.01, "agent_tool_result", {"tool": "fs_glob", "path": pat})
                 except Exception:
                     pass
 
@@ -388,14 +447,11 @@ async def adapt_repository_with_agent(
                 try:
                     final_diff = dispatch_tool_call("fs_diff", {"paths": candidate_paths})
                     tool_log.append({"name": "fs_diff", "args": {"paths": candidate_paths}, "result": final_diff})
-                    try:
-                        await publish("agent_tool_result", data={"tool": "fs_diff", "path": ", ".join(candidate_paths)})
-                    except Exception:
-                        pass
+                    await pbar.bump(0.02, "agent_tool_result", {"tool": "fs_diff", "path": ", ".join(candidate_paths)})
                 except Exception:
                     pass
 
-            # Build and publish summary (always)
+            # Build summary & persist
             unique_touched = sorted({p for p in touched_paths if isinstance(p, str) and p})
             summary = (
                 "DONE: Updated files/folders -> "
@@ -406,7 +462,6 @@ async def adapt_repository_with_agent(
             )
             diff_preview = _extract_diff_preview(tool_log)
 
-            # Persist last run (trimmed)
             _persist_last_run(
                 {
                     "job_id": job_id_seen,
@@ -417,13 +472,10 @@ async def adapt_repository_with_agent(
                 }
             )
 
-            try:
-                await publish("agent_summary", data={"touched": unique_touched, "has_diff": bool(diff_preview)}, progress=0.97)
-                await publish("agent_done", progress=0.98)
-            except Exception:
-                pass
+            await pbar.set(0.97, "agent_summary", {"touched": unique_touched, "has_diff": bool(diff_preview)})
+            await pbar.set(0.98, "agent_done")
 
-    # Final payload
+    # --- Wrap-up (0.98 → 1.00 on client side)
     return {
         "job_id": job_id_seen,
         "summary": (
