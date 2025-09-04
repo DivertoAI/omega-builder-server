@@ -13,6 +13,13 @@ from backend.app.integrations.openai.client import get_openai_client
 from backend.app.integrations.agent.tools import openai_tool_specs, dispatch_tool_call
 from backend.app.models.spec import OmegaSpec
 
+# Optional import: quality gate (tolerant to absence / signature drift)
+try:
+    # Prefer a single entrypoint function if provided
+    from backend.app.core.quality_gate import run_quality_gate as _run_quality_gate  # type: ignore
+except Exception:  # pragma: no cover - best-effort optional import
+    _run_quality_gate = None  # type: ignore
+
 # Where we persist the last run details for quick debugging/observability
 OMEGA_DIR = Path("workspace/.omega")
 LAST_RUN_PATH = OMEGA_DIR / "last_run.json"
@@ -21,51 +28,29 @@ LAST_RUN_PATH = OMEGA_DIR / "last_run.json"
 SYSTEM = """You are Omega Builder Agent.
 
 Goal:
-- Produce a runnable, no-build web application (plain HTML/CSS/JS) that fulfills the provided OmegaSpec or brief.
+- Adapt this repository to implement/reflect the provided OmegaSpec or brief as a REAL, runnable application.
+- If the caller hints at a platform/architecture (e.g., target=flutter, architecture=mvvm), that guidance is binding.
 
 Hard rules:
-- Do NOT emit placeholder scaffolds. Deliver working pages, real UI, and real logic.
-- Use only the filesystem tools: fs_map, fs_glob, fs_read, fs_write, fs_mkdir, fs_delete, fs_diff, fs_patch.
-- Prefer minimal, incremental, idempotent edits: if re-run, patch/replace the same managed blocks without duplicating.
-- Keep the app runnable with zero tooling: no bundlers, no frameworks. Only index.html, styles.css, main.js.
-- Persist client-side state locally (e.g., localStorage) when the brief implies persistence.
-- Before writing, fs_read existing files to avoid duplicates. Use fs_patch for surgical edits. After edits, run fs_diff.
+- Do NOT create placeholder scaffolds or skeletal stubs.
+- Author complete, runnable code and config for the chosen platform:
+  * Flutter (MVVM): full project structure, pubspec, provider state mgmt, shared_preferences, tests.
+  * Web (no build): index.html + styles.css + main.js, with real functionality and localStorage persistence.
+- Use only the provided filesystem tools: fs_map, fs_glob, fs_read, fs_write, fs_mkdir, fs_delete, fs_diff, fs_patch.
+- Prefer minimal, incremental edits that reflect the spec and brief.
+- Maintain idempotency: reruns must not duplicate content; patch/replace managed regions.
 
-Completion requirements (mandatory):
-1) The app lives under workspace/apps/<slug>/ (slugify the spec/brief name).
-2) At minimum, create:
-   - index.html  (real UI that actually performs the requested tasks)
-   - styles.css  (styling consistent with the brief, e.g., dark theme)
-   - main.js     (actual behavior; no placeholders)
-3) Verify with:
-   - fs_glob on workspace/apps/<slug>/*
-   - fs_read on index.html, styles.css, main.js to ensure they are non-empty and coherent
-   - fs_diff to show the final changes
-4) When you’re finished, reply with a short plain-text summary starting with: DONE:
-"""
+Process (mandatory):
+- Before writing to a file: fs_read it to see current content.
+- Use fs_patch for surgical changes; fs_write for new or fully replaced files.
+- After any write/patch sequence, run fs_diff to inspect changes you just made.
+- ALWAYS FINISH by:
+  1) Running fs_glob on expected output paths (project root / app dir).
+  2) Running fs_diff to emit a final repo diff.
+- Never duplicate content on reruns; replace/patch the same managed blocks instead.
 
-KICKOFF_INSTRUCTION = """Plan your edits first, then create a runnable app under workspace/apps/<slug>/.
-
-Initial repo inspection:
-- Call fs_glob on: "backend/**/*.py", "workspace/**/*", "assets/**/*", "pyproject.toml", "README.md".
-- fs_read any file you intend to modify before writing.
-
-Implementation order:
-1) Determine <slug> from the spec/brief title (e.g., "todo" for a Todo app).
-2) Ensure directory exists: workspace/apps/<slug> (fs_mkdir if missing).
-3) Create real, working files:
-   - index.html: Proper HTML structure, visible UI matching the brief, link styles.css and main.js.
-   - styles.css: Real styles (e.g., dark theme when requested).
-   - main.js: Actual logic (CRUD/state/events). Use localStorage if persistence is implied.
-4) Idempotency: if files exist, use fs_read + fs_patch to update relevant sections without duplication.
-
-Verification and finish:
-- fs_glob workspace/apps/<slug>/*
-- fs_read index.html, styles.css, main.js (ensure non-empty and coherent)
-- fs_diff on workspace/apps/<slug>
-- Then emit a DONE: summary.
-
-Never output placeholder scaffolds; always produce a runnable app.
+Completion:
+- When you believe you’re done, reply with a short plain-text summary starting with: DONE:
 """
 
 USER_PREFIX = """Repository context:
@@ -73,26 +58,18 @@ USER_PREFIX = """Repository context:
 - SSE progress bus available at /api/stream.
 - Workspace root is this repo root.
 
-Specification (OmegaSpec JSON):
+Specification (OmegaSpec JSON or brief context follows):
 """
 
-KICKOFF_INSTRUCTION = """First, inspect the repo structure. Call fs_glob with each of these patterns (one call per pattern), then selectively fs_read interesting files:
+KICKOFF_INSTRUCTION = """Plan the app and THEN build it.
 
-- "backend/**/*.py"
-- "workspace/**/*"
-- "assets/**/*"
-- "pyproject.toml"
-- "README.md"
-
-After inspection, plan minimal edits to reflect navigation and endpoints from the spec. Then perform edits using fs_write/fs_mkdir/fs_patch as needed.
-
-Edits priority (do in order, skipping any that already exist):
-1) Ensure backend/main.py includes plan & generate routes and SSE.
-2) Create/patch a minimal frontend/workspace README with routes reflecting spec.navigation.
-3) Add TODO stubs in appropriate places (no mock data).
-4) Keep changes idempotent. If a file already matches, do nothing.
-
-Remember to fs_diff after modifying files, and finish with a final fs_diff + fs_glob checks.
+1) Inspect repo structure via fs_glob (backend/**/*.py, workspace/**/*, assets/**/*, pyproject.toml, README.md).
+2) Determine the target platform and architecture from the latest user turn:
+   - If dev instructions specify Flutter MVVM, create a full Flutter app (pubspec, lib/*, tests).
+   - Else build a runnable web app with index.html/styles.css/main.js and actual feature logic.
+3) Create necessary directories and files. Use fs_write for new files, fs_patch for edits.
+4) After writing, run fs_diff to verify changes.
+5) FINISH with fs_glob on the created app directory and a final fs_diff snapshot.
 """
 
 
@@ -252,6 +229,66 @@ def _loop_progress_fn(steps: int) -> Tuple[float, float]:
     return start, per_step
 
 
+# ---------------------------- quality gate integration ----------------------------
+
+async def _maybe_run_quality_gate(
+    spec: OmegaSpec,
+    pbar: _Pbar,
+    validate_only: bool,
+) -> Optional[Dict[str, Any]]:
+    """
+    Attempts to run the optional quality gate and return a normalized dict result.
+    Emits SSE progress events. Never raises.
+    """
+    try:
+        await pbar.set(0.945, "quality_gate_start", {"validate_only": validate_only})
+    except Exception:
+        pass
+
+    if _run_quality_gate is None:
+        try:
+            await pbar.bump(0.002, "quality_gate_missing", {"reason": "module_or_symbol_not_importable"})
+        except Exception:
+            pass
+        return None
+
+    # Try a few common signatures to be resilient against minor API drift.
+    raw_result: Any = None
+    try:
+        try:
+            raw_result = _run_quality_gate(spec=spec, validate_only=validate_only)  # type: ignore[arg-type]
+        except TypeError:
+            try:
+                raw_result = _run_quality_gate(spec=spec)  # type: ignore[misc]
+            except TypeError:
+                raw_result = _run_quality_gate()  # type: ignore[misc]
+    except Exception as e:
+        try:
+            await pbar.bump(0.003, "quality_gate_error", {"error": str(e)})
+        except Exception:
+            pass
+        return {"ok": False, "error": str(e)}
+
+    # Normalize to a dict
+    if raw_result is None:
+        result = {"ok": False, "error": "quality gate returned None"}
+    elif isinstance(raw_result, dict):
+        result = raw_result
+    else:
+        result = {
+            "ok": bool(getattr(raw_result, "ok", False) or getattr(raw_result, "passed", False)),
+            "summary": getattr(raw_result, "summary", None),
+            "errors": getattr(raw_result, "errors", None),
+            "checks": getattr(raw_result, "checks", None),
+        }
+
+    try:
+        await pbar.bump(0.005, "quality_gate_done", {"ok": result.get("ok", None)})
+    except Exception:
+        pass
+    return result
+
+
 # ---------------------------- main loop ----------------------------
 
 async def adapt_repository_with_agent(
@@ -264,13 +301,13 @@ async def adapt_repository_with_agent(
 ) -> Dict[str, Any]:
     """
     Orchestrates a Chat Completions function-calling loop to apply edits described by the spec.
-    Returns a summary, a log of tool_call results, a diff preview, and the job_id.
+    Returns a summary, a log of tool_call results, a diff preview, the job_id, and (if available) quality gate results.
 
     Behavior:
       - validate_only: run read/plan/diff but DO NOT mutate the filesystem (fs_write/fs_patch/fs_mkdir/fs_delete are skipped).
       - wall_clock_budget_sec: hard wall-clock budget for the entire run (default 60s).
       - per_call_timeout_sec: per ChatCompletion turn timeout (default 20s).
-      - Forced finalization ensures fs_glob/fs_diff and an agent_summary are emitted.
+      - Forced finalization ensures fs_glob/fs_diff, quality gate attempt, and an agent_summary are emitted.
       - Persists last run to workspace/.omega/last_run.json for quick debugging.
     """
     # Defaults (overridable via settings)
@@ -287,6 +324,9 @@ async def adapt_repository_with_agent(
     # For summary after finalization
     touched_paths: List[str] = []
     WRITEY = {"fs_write", "fs_patch", "fs_mkdir", "fs_delete"}
+
+    # Quality gate result we will surface
+    quality_gate_result: Optional[Dict[str, Any]] = None
 
     async with start_job("generate", data={"mode": "agent"}) as (job_id, publish):
         job_id_seen = job_id
@@ -451,6 +491,12 @@ async def adapt_repository_with_agent(
                 except Exception:
                     pass
 
+            # Run the quality gate (best-effort; tolerant to absence or exceptions)
+            try:
+                quality_gate_result = await _maybe_run_quality_gate(spec, pbar, validate_only)
+            except Exception:
+                quality_gate_result = {"ok": False, "error": "quality gate wrapper failure"}
+
             # Build summary & persist
             unique_touched = sorted({p for p in touched_paths if isinstance(p, str) and p})
             summary = (
@@ -460,6 +506,21 @@ async def adapt_repository_with_agent(
                 if unique_touched
                 else "DONE: Agent run completed."
             )
+
+            # Annotate summary with quality signal if available
+            if isinstance(quality_gate_result, dict) and ("ok" in quality_gate_result):
+                q_ok = bool(quality_gate_result.get("ok"))
+                q_errors = quality_gate_result.get("errors")
+                n_err = (
+                    len(q_errors)
+                    if isinstance(q_errors, (list, tuple))
+                    else int(quality_gate_result.get("fail_count") or 0)
+                )
+                qual_tag = f"QUALITY: {'PASS' if q_ok else 'FAIL'}"
+                if not q_ok:
+                    qual_tag += f" ({n_err} issue{'s' if n_err != 1 else ''})"
+                summary = f"{summary} | {qual_tag}"
+
             diff_preview = _extract_diff_preview(tool_log)
 
             _persist_last_run(
@@ -469,22 +530,42 @@ async def adapt_repository_with_agent(
                     "diff_preview": diff_preview,
                     "tool_log": tool_log,
                     "validate_only": validate_only,
+                    "quality_gate": quality_gate_result,
                 }
             )
 
-            await pbar.set(0.97, "agent_summary", {"touched": unique_touched, "has_diff": bool(diff_preview)})
+            await pbar.set(0.97, "agent_summary", {
+                "touched": unique_touched,
+                "has_diff": bool(diff_preview),
+                "quality": (quality_gate_result or {}).get("ok") if isinstance(quality_gate_result, dict) else None,
+            })
             await pbar.set(0.98, "agent_done")
 
     # --- Wrap-up (0.98 → 1.00 on client side)
+    base_summary = (
+        "DONE: Updated files/folders -> "
+        + ", ".join(sorted({p for p in touched_paths})[:12])
+        + ("..." if len(set(touched_paths)) > 12 else "")
+        if touched_paths
+        else "DONE: Agent run completed."
+    )
+    if isinstance(quality_gate_result, dict) and ("ok" in quality_gate_result):
+        q_ok = bool(quality_gate_result.get("ok"))
+        q_errors = quality_gate_result.get("errors")
+        n_err = (
+            len(q_errors)
+            if isinstance(q_errors, (list, tuple))
+            else int(quality_gate_result.get("fail_count") or 0)
+        )
+        qual_tag = f"QUALITY: {'PASS' if q_ok else 'FAIL'}"
+        if not q_ok:
+            qual_tag += f" ({n_err} issue{'s' if n_err != 1 else ''})"
+        base_summary = f"{base_summary} | {qual_tag}"
+
     return {
         "job_id": job_id_seen,
-        "summary": (
-            "DONE: Updated files/folders -> "
-            + ", ".join(sorted({p for p in touched_paths})[:12])
-            + ("..." if len(set(touched_paths)) > 12 else "")
-            if touched_paths
-            else "DONE: Agent run completed."
-        ),
+        "summary": base_summary,
         "tool_log": tool_log,
         "diff_preview": _extract_diff_preview(tool_log),
+        "quality_gate": quality_gate_result,
     }

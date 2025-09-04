@@ -1,3 +1,4 @@
+# backend/app/api/routes_debug.py
 from __future__ import annotations
 
 import asyncio
@@ -8,38 +9,33 @@ from typing import Any, Dict
 from fastapi import APIRouter, HTTPException, Response, status
 
 from backend.app.core.progress import start_job
+from backend.app.services.job_store import get_last_run, save_last_run
+from backend.app.services.meta_store import compute_workspace_diff_summary  # you already have this
 
 router = APIRouter(prefix="/api", tags=["debug"])
 
-
 @router.get("/last-run")
 def last_run() -> Dict[str, Any]:
-    """
-    Returns the JSON persisted by the agent at workspace/.omega/last_run.json.
-
-    Shape (best effort, depends on the last run):
-    {
-      "job_id": "...",
-      "summary": "DONE: ...",
-      "diff_preview": "...",
-      "tool_log": [...],            # trimmed to last ~200 entries by the agent
-      "validate_only": false
-    }
-    """
-    p = Path("workspace/.omega/last_run.json")
-    if not p.exists():
+    data = get_last_run()
+    if not data:
         raise HTTPException(status_code=404, detail="No runs recorded yet")
-    try:
-        text = p.read_text(encoding="utf-8")
-        data = json.loads(text)
-        if not isinstance(data, dict):
-            raise ValueError("last_run.json must contain a JSON object")
-        return data
-    except HTTPException:
-        # re-raise FastAPI HTTPException unchanged
-        raise
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Failed to read last_run.json: {e}")
+    return data
+
+@router.post("/debug/force-last-run")
+def force_last_run() -> Dict[str, Any]:
+    """
+    Compute current workspace diff and persist as last run (job_id='manual').
+    """
+    diff = compute_workspace_diff_summary()
+    save_last_run(
+        "manual",
+        summary=diff.get("summary", "(no summary)"),
+        diff_preview=diff.get("preview", ""),
+        tool_log=[],
+    )
+    return {"ok": True, "summary": diff.get("summary")}
+
+# (keep your existing /debug/last-run/html and /debug/progress-demo routes below)
 
 
 @router.get("/debug/last-run/html")

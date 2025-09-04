@@ -1,6 +1,3 @@
-# docker-compose.yml
-version: "3.9"
-
 services:
   omega:
     build:
@@ -9,31 +6,56 @@ services:
     container_name: omega-builder
     ports:
       - "8000:8000"
-    # Compose auto-loads .env in the repo root; we also pass it explicitly.
+
     env_file:
       - .env
+
     environment:
-      # Good defaults for dev; .env can override anything here.
       PYTHONUNBUFFERED: "1"
+      PYTHONPATH: /app
       OMEGA_RESET_ON_START: "1"
+      OMEGA_LLM_MODEL: "gpt-5"
+      OMEGA_IMAGE_MODEL: "gpt-image-1"
+      # Point the app to the Redis service
+      REDIS_URL: "redis://redis:6379/0"
+
     volumes:
-      # Live-reload: mount the repo into the container
       - .:/app:delegated
-      # Optional: persist the workspace cache (comment out if you prefer ephemeral)
       - omega_workspace:/app/workspace/.omega
+
     command: >
-      uvicorn backend.main:app
+      python -m uvicorn backend.main:app
       --host 0.0.0.0
       --port 8000
-      --reload
-    # If your Dockerfile sets a non-root WORKDIR, adjust the mount path above accordingly.
-    # healthcheck (optional)
+
+    tty: true
+    stdin_open: true
+    restart: unless-stopped
+
     healthcheck:
       test: ["CMD", "curl", "-fsS", "http://localhost:8000/api/health"]
       interval: 10s
       timeout: 3s
       retries: 5
       start_period: 10s
+
+    depends_on:
+      redis:
+        condition: service_healthy
+
+  redis:
+    image: redis:7-alpine
+    container_name: omega-redis
+    command: ["redis-server", "--appendonly", "yes"]
+    healthcheck:
+      test: ["CMD", "redis-cli", "PING"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+    restart: unless-stopped
+    # Optional: expose on host for debugging
+    # ports:
+    #   - "6379:6379"
 
 volumes:
   omega_workspace:
