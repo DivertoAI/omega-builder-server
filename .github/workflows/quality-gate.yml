@@ -1,0 +1,19 @@
+# .github/workflows/quality-gate.yml
+name: Quality Gate
+on: [push, pull_request]
+jobs:
+  gate:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: subosito/flutter-action@v2
+        with: { flutter-version: "stable" }
+      - run: flutter --version
+      - working-directory: workspace/apps/omega-app
+        run: flutter pub get
+      - working-directory: workspace/apps/omega-app
+        run: flutter analyze --no-preamble
+      - working-directory: workspace/apps/omega-app
+        run: flutter test --reporter=compact
+      - working-directory: workspace/apps/omega-app
+        run: flutter build web --release
