@@ -19,86 +19,132 @@ class OpenAIUnavailable(RuntimeError):
     pass
 
 
+def _coerce_part_to_input_text(part: Any) -> Dict[str, Any]:
+    """
+    Normalize any content 'part' into Responses format:
+      {"type": "input_text", "text": "<...>"}
+
+    Accepts:
+      - plain strings
+      - {"type": "text", "text": "..."}  (old style)  -> coerced
+      - {"type": "input_text", "text": "..."}         -> passed through
+      - {"text": "..."} with no 'type'                -> coerced
+      - anything else -> stringified
+    """
+    if isinstance(part, str):
+        return {"type": "input_text", "text": part}
+
+    if isinstance(part, dict):
+        p = dict(part)
+        # prefer explicit text if present
+        txt = p.get("text")
+        # normalize the type
+        ptype = p.get("type")
+        if ptype == "input_text" and isinstance(txt, str):
+            return {"type": "input_text", "text": txt}
+        if ptype == "text" and isinstance(txt, str):
+            return {"type": "input_text", "text": txt}
+        if ptype is None and isinstance(txt, str):
+            return {"type": "input_text", "text": txt}
+        # last-ditch: stringify whole dict
+        return {"type": "input_text", "text": str(part)}
+
+    # unknown type -> stringify
+    return {"type": "input_text", "text": str(part)}
+
+
 def _messages_to_responses_input(messages: Sequence[Dict[str, Any]]) -> Dict[str, Any]:
     """
-    Convert a list of chat-style messages:
-        [{"role": "system|user|assistant", "content": str|list}, ...]
-    into a Responses API input payload.
+    Convert chat-style messages:
+        [{"role": "system|user|assistant", "content": str|list|dict}, ...]
+    into a Responses API 'input' payload.
 
-    Responses API expects:
-        {
-          "input": [
-            {
-              "role": "...",
-              "content": [{"type": "input_text", "text": "..."}]
-            }
-          ]
-        }
+    Responses expects:
+      {
+        "input": [
+          {
+            "role": "...",
+            "content": [{"type": "input_text", "text": "..."}]
+          },
+          ...
+        ]
+      }
     """
     formatted: List[Dict[str, Any]] = []
     for m in messages:
         role = str(m.get("role", "")).strip() or "user"
         content = m.get("content", "")
+
+        # common cases fast-path
         if isinstance(content, str):
-            formatted.append(
-                {
-                    "role": role,
-                    "content": [{"type": "input_text", "text": content}],
-                }
-            )
-        elif isinstance(content, list):
-            # If caller already provided responses-style parts, pass through (sanity fallback).
-            # NOTE: ensure any plain "text" types are upgraded to "input_text".
-            parts: List[Dict[str, Any]] = []
+            formatted.append({"role": role, "content": [{"type": "input_text", "text": content}]})
+            continue
+
+        # already list of parts? normalize each
+        parts: List[Dict[str, Any]] = []
+        if isinstance(content, list):
             for part in content:
-                if isinstance(part, dict):
-                    p = dict(part)
-                    t = p.get("type")
-                    if t == "text":  # normalize to input_text
-                        p["type"] = "input_text"
-                    parts.append(p)
-            formatted.append({"role": role, "content": parts})
+                parts.append(_coerce_part_to_input_text(part))
+        elif isinstance(content, dict):
+            # single part dict
+            parts.append(_coerce_part_to_input_text(content))
         else:
-            # Coerce unknowns to text
-            formatted.append(
-                {
-                    "role": role,
-                    "content": [{"type": "input_text", "text": str(content)}],
-                }
-            )
+            # anything else -> stringify
+            parts.append({"type": "input_text", "text": str(content)})
+
+        formatted.append({"role": role, "content": parts})
+
     return {"input": formatted}
 
 
 def _extract_responses_text(resp: Any) -> str:
     """
     Best-effort extraction of text from a Responses API result.
+    Supports:
+      - resp.output_text (SDK convenience)
+      - resp.output[*].content[*].text or .text.value
+      - resp.output[*].content[*]["text"] when plain dicts are returned
     """
-    # Preferred convenience attr (SDK adds this on Responses objects)
+    # Preferred convenience attr (many SDK versions add this)
     if hasattr(resp, "output_text") and isinstance(resp.output_text, str):
         return resp.output_text.strip()
 
-    # Manual traversal fallback
     chunks: List[str] = []
+
+    # Typical Responses object: resp.output is a list of items
     try:
         output = getattr(resp, "output", None) or []
         for item in output:
-            if getattr(item, "type", None) == "message":
-                for c in getattr(item, "content", []) or []:
-                    # The Responses API uses parts like {"type": "output_text", "text": "..."}
-                    # Some SDK variants expose .text (str) or .text.value (str)
-                    tval = None
+            itype = getattr(item, "type", None) if not isinstance(item, dict) else item.get("type")
+            if itype != "message":
+                continue
+
+            content = getattr(item, "content", None)
+            if isinstance(item, dict):
+                content = item.get("content", content)
+            content = content or []
+
+            for c in content:
+                # object-like access
+                text_attr = None
+                if not isinstance(c, dict):
+                    # attempt attribute forms
                     if hasattr(c, "text"):
                         t = getattr(c, "text")
                         if isinstance(t, str):
-                            tval = t
+                            text_attr = t
                         else:
-                            tval = getattr(t, "value", None)
-                    if not tval and isinstance(c, dict):  # defensive if SDK returns plain dicts
-                        tval = c.get("text")
-                    if isinstance(tval, str):
-                        chunks.append(tval)
+                            text_attr = getattr(t, "value", None)
+                else:
+                    # dict form
+                    text_attr = c.get("text")
+
+                if isinstance(text_attr, str):
+                    chunks.append(text_attr)
     except Exception:
+        # if structure is different, try a very defensive parse
         pass
+
     return "".join(chunks).strip()
 
 
@@ -108,7 +154,6 @@ class OpenAIClient:
     def __init__(self) -> None:
         self.enabled = bool(settings.openai_api_key and OpenAI is not None)
         if self.enabled:
-            # Pass key + optional org/project explicitly (works with Teams/Enterprise)
             self._client = OpenAI(
                 api_key=settings.openai_api_key,
                 organization=(getattr(settings, "openai_org_id", "") or None),
@@ -121,10 +166,6 @@ class OpenAIClient:
         if not self.enabled or self._client is None:
             raise OpenAIUnavailable("OpenAI key missing or SDK not installed")
 
-    # ---------------------------------------------------------------------
-    # Generic respond(): one call that works for O3 (planner) and GPT-5 (coder)
-    # via the Responses API. Provide chat-style messages and pick a model.
-    # ---------------------------------------------------------------------
     @retry(
         retry=retry_if_exception_type(Exception),
         wait=wait_exponential(multiplier=0.5, min=0.5, max=8),
@@ -136,8 +177,8 @@ class OpenAIClient:
         *,
         model: Optional[str] = None,
         messages: Sequence[Dict[str, Any]],
-        # Do NOT pass temperature to Responses (some models reject it)
-        temperature: Optional[float] = None,  # kept for signature compatibility; ignored below
+        # Kept for signature compatibility; Responses often rejects temperature:
+        temperature: Optional[float] = None,  # noqa: ARG002
         max_output_tokens: Optional[int] = None,
     ) -> str:
         """
@@ -149,20 +190,21 @@ class OpenAIClient:
         self._require_enabled()
 
         payload = _messages_to_responses_input(messages)
+        model_name = (model or settings.omega_llm_model or "").strip()
         req: Dict[str, Any] = {
-            "model": model or settings.omega_llm_model,
+            "model": model_name or settings.omega_llm_model,
             **payload,
         }
-        # IMPORTANT: do not include 'temperature' with Responses API
         if max_output_tokens is not None:
             req["max_output_tokens"] = max_output_tokens
+
+        # Optional, harmless hint for GPT-5 family
+        if model_name.lower().startswith("gpt-5"):
+            req["reasoning"] = {"effort": "medium"}
 
         resp = self._client.responses.create(**req)
         return _extract_responses_text(resp)
 
-    # ---------------------------------------------------------------------
-    # Simple health pings (text/images)
-    # ---------------------------------------------------------------------
     @retry(
         retry=retry_if_exception_type(Exception),
         wait=wait_exponential(multiplier=0.5, min=0.5, max=8),
@@ -172,7 +214,6 @@ class OpenAIClient:
     def text_echo(self, text: str = "ping") -> Optional[str]:
         """
         Tiny Responses API ping; returns echoed text or None if disabled.
-        (We still avoid passing temperature to Responses.)
         """
         if not self.enabled:
             return None
@@ -180,9 +221,7 @@ class OpenAIClient:
 
         out = self.respond(
             model=settings.omega_llm_model,
-            messages=[
-                {"role": "user", "content": f"Return exactly this text: {text}"},
-            ],
+            messages=[{"role": "user", "content": f"Return exactly this text: {text}"}],
             max_output_tokens=64,
         )
         return out or None
