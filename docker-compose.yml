@@ -1,3 +1,5 @@
+version: "3.9"
+
 services:
   omega:
     build:
@@ -27,14 +29,16 @@ services:
       OMEGA_COMPILE_LOCAL_FALLBACK: "1"   # if remote fails, fall back to local
       AI_VM_URL: "http://ai-vm:8080"      # service DNS inside compose network
 
+      # Ensure omega writes artifacts where ai-vm can see them
+      OMEGA_STAGING_ROOT: "/workspace/staging"
+
       # Optional safety/time caps (tweak as needed)
       OMEGA_MAX_AGENT_ROUNDS: "8"
       OMEGA_DEFAULT_WALL_CLOCK_SEC: "900"
     volumes:
       - .:/app:delegated
+      - .:/workspace:delegated          # 👈 shared path visible to both omega and ai-vm
       - omega_workspace:/app/workspace/.omega
-      # (optional) if you want omega to also see the same /workspace path as ai-vm
-      # - .:/workspace:delegated
     command: >
       python -m uvicorn backend.main:app
       --host 0.0.0.0

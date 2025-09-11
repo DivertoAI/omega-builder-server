@@ -28,7 +28,10 @@ RUN flutter --version && flutter config --enable-web || true
 
 # Install Python deps for the API
 USER root
-RUN python3 -m pip install --no-cache-dir fastapi "uvicorn[standard]" pydantic==2.* \
+RUN python3 -m pip install --no-cache-dir \
+  fastapi==0.116.1 \
+  "uvicorn[standard]==0.30.5" \
+  "pydantic==2.*" \
   && chmod 755 /usr/local/bin
 USER flutter
 

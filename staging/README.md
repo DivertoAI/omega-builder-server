@@ -1,19 +1,19 @@
 Omega App
 
-A minimal Flutter app scaffold to browse items with search and a detail page.
-
-Features
-- Home screen with search and a simple item list
-- Detail page for selected item
-- Health page showing "ok"
-
-Prerequisites
-- Flutter SDK installed
+A minimal Flutter app to browse items with search and a detail page. It also exposes a simple health endpoint.
 
 Run
-1) flutter pub get
-2) flutter run
+- Ensure Flutter SDK is installed.
+- In the project directory, create platform folders if needed: flutter create .
+- Run the app: flutter run
 
-Routes
-- /home: Home screen
-- /health: Health screen (also accessible via the heart icon in the top bar)
+Health endpoint
+- When the app starts (on mobile/desktop), it launches a tiny HTTP server.
+- Endpoint: GET http://localhost:8080/health
+- Response: ok (200)
+- If port 8080 is unavailable, it falls back to another port; the chosen address is printed to the debug console.
+- Note: On Flutter Web, the health server is disabled.
+
+Features
+- Home screen with a search box filtering a simple list of items.
+- Tap an item to view a basic detail page.
