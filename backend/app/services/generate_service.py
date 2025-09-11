@@ -2,216 +2,200 @@
 from __future__ import annotations
 
 import json
-import os
-import re
-import time
 from pathlib import Path
-from typing import Dict, Any, List, Tuple
+from typing import Any, Dict, List, Union
 
-from ..models.spec import OmegaSpec
-from ..services.quality_gate import run_gates, promote  # <- unified gate (web + flutter)
-from ..services.job_store import save_last_run          # <- NEW: persist last run
-from ..services.meta_store import compute_workspace_diff_summary  # <- NEW: diff/summary
+from backend.app.core.config import settings
+from backend.app.integrations.openai.client import get_openai_client
+from backend.app.models.spec import OmegaSpec
 
-# --------------------------------------------------------------------------------------
-# Helpers
-# --------------------------------------------------------------------------------------
 
-def _slug(s: str) -> str:
-    s = (s or "app").lower()
-    s = re.sub(r"[^a-z0-9\\-]+", "-", s).strip("-")
-    return s or "app"
+_CODEGEN_SYSTEM = """You are the Code Generator for Omega Builder.
+You will receive a validated OmegaSpec (JSON). Produce a small, runnable scaffold as a set of files.
 
-def _build_root(workspace: Path) -> Path:
-    """
-    Returns the folder where we stage build outputs before promotion.
-    """
-    # You can change this to `workspace/.omega/builds` if you prefer that layout.
-    # Using `.omega/builds` tends to keep top-level workspace clean.
-    root = Path(workspace) / ".omega" / "builds"
-    root.mkdir(parents=True, exist_ok=True)
-    return root
+Rules:
+- Return ONLY a JSON object with the following shape:
+  {
+    "files": [
+      {"path": "<relative path under project>", "language": "<mime or short label>", "contents": "<file text>"},
+      ...
+    ],
+    "notes": "<very brief generation notes>"
+  }
+- Keep it minimal but runnable; prioritize a README and one simple app shell matching the spec's navigation.home.
+- No placeholders like TODO in code; keep it clean and concise.
+- Use UTF-8 text files only. No binaries.
+- Prefer Flutter if spec hints an app, otherwise a simple web app (HTML+JS) is acceptable.
+"""
 
-# --------------------------------------------------------------------------------------
-# React (Vite) planning/writing — unchanged except: we now run a web gate after writing
-# --------------------------------------------------------------------------------------
+_CODEGEN_USER_TEMPLATE = """OmegaSpec:
+{spec_json}
 
-def _files_for_react(spec: OmegaSpec) -> List[Tuple[str, str]]:
-    name = spec.name or "Omega App"
-    desc = spec.description or ""
-    theme_dark_css = """
-:root { color-scheme: dark; }
-* { box-sizing: border-box; }
-html, body, #root { height: 100%; margin: 0; }
-body { background:#0b0f16; color:#e5e7eb; font-family: ui-sans-serif,system-ui,Segoe UI,Roboto,Helvetica,Arial; }
-a { color:#93c5fd; text-decoration:none; }
-.container { max-width: 900px; margin: 0 auto; padding: 2rem; }
-.card { background:#111827; border:1px solid #1f2937; border-radius: 12px; padding:1rem; box-shadow: 0 4px 16px rgba(0,0,0,0.25); }
-.title { font-size: 1.5rem; font-weight: 700; margin: 0 0 0.5rem; }
-.sub { opacity: 0.75; margin: 0 0 1rem; }
-.nav { margin: 1rem 0; display:flex; gap:.5rem; flex-wrap: wrap; }
-.btn { background:#1f2937; border:1px solid #374151; border-radius: 10px; padding:.5rem .75rem; }
-.badge { display:inline-block; padding:.125rem .5rem; border:1px solid #374151; border-radius:9999px; font-size:.75rem; }
-    """.strip()
+Output only the JSON manifest described above (no markdown, no code fences)."""
 
-    nav_items = spec.navigation.items if spec.navigation and spec.navigation.items else []
-    nav_html = "".join(
-        f'<a class="btn" href="{it.get("path","/")}">{it.get("title","")}</a>'
-        for it in nav_items
-    )
 
-    idx_html = f"""<!doctype html>
-<html>
+def _safe_write(root: Path, rel_path: str, text: str) -> str:
+    rel = rel_path.strip().lstrip("/").replace("\\", "/")
+    if not rel or ".." in Path(rel).parts:
+        raise ValueError(f"Refusing to write outside staging: {rel_path!r}")
+    out_path = root / rel
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    out_path.write_text(text, encoding="utf-8")
+    return str(out_path.relative_to(root))
+
+
+def _fallback_scaffold(spec: OmegaSpec, reason: str = "unknown") -> Dict[str, Any]:
+    files: List[Dict[str, str]] = []
+    readme = f"""# {spec.name}
+
+{spec.description}
+
+This is a minimal scaffold generated without remote codegen (OpenAI disabled or unreachable).
+
+## Contents
+- `README.md`
+- `web/index.html`
+
+## Run (static)
+Open `web/index.html` in a browser.
+"""
+    files.append({"path": "README.md", "language": "text/markdown", "contents": readme})
+
+    home = spec.navigation.home or "home"
+    html = f"""<!doctype html>
+<html lang="en">
   <head>
-    <meta charset="utf-8" />
-    <meta name="viewport" content="width=device-width,initial-scale=1" />
-    <title>{name}</title>
-    <link rel="stylesheet" href="/styles.css" />
+    <meta charset="utf-8"/>
+    <meta name="viewport" content="width=device-width,initial-scale=1"/>
+    <title>{spec.name}</title>
+    <style>
+      :root {{ --radius: {spec.theme.radius[0] if spec.theme.radius else 8}px; }}
+      body {{ font-family: system-ui, -apple-system, Segoe UI, Roboto, sans-serif; margin:0; }}
+      header {{ padding:16px; border-bottom:1px solid #ddd; }}
+      main {{ padding:24px; }}
+      .card {{ border:1px solid #e6e6e6; border-radius: var(--radius); padding:16px; }}
+    </style>
   </head>
   <body>
-    <div id="root">
-      <div class="container">
-        <div class="card">
-          <h1 class="title">{name}</h1>
-          <p class="sub">{desc}</p>
-          <div class="nav">{nav_html or '<span class="badge">home</span>'}</div>
-        </div>
+    <header><strong>{spec.name}</strong></header>
+    <main>
+      <div class="card">
+        <h1>{home.title() if isinstance(home, str) else "Home"}</h1>
+        <p>{spec.description}</p>
+        <p>OpenAI codegen is disabled or failed; this is a fallback static stub.</p>
       </div>
-    </div>
-    <script src="/main.js" type="module"></script>
+    </main>
   </body>
 </html>
 """
+    files.append({"path": "web/index.html", "language": "text/html", "contents": html})
+    return {"files": files, "notes": f"local fallback scaffold (reason={reason})"}
 
-    main_js = """export function hello(){ console.log("hello from omega codegen"); } hello();"""
 
-    pkg_json = {
-        "name": _slug(name),
-        "private": True,
-        "version": "0.1.0",
-        "scripts": {
-            "dev": "npx --yes vite",
-            "build": "npx --yes vite build",
-            "preview": "npx --yes vite preview"
-        },
-        "devDependencies": { "vite": "^5.4.0" }
+def _extract_first_json_object(text: str) -> Dict[str, Any]:
+    if not isinstance(text, str):
+        raise ValueError("LLM output is not text")
+    s = text.strip()
+    if s.startswith("{") and s.endswith("}"):
+        return json.loads(s)
+    start = s.find("{")
+    if start == -1:
+        raise ValueError("No JSON object found in LLM output")
+    depth = 0
+    for i in range(start, len(s)):
+        ch = s[i]
+        if ch == "{":
+            depth += 1
+        elif ch == "}":
+            depth -= 1
+            if depth == 0:
+                return json.loads(s[start : i + 1])
+    raise ValueError("Unbalanced JSON braces in LLM output")
+
+
+def _prompt_codegen(spec: OmegaSpec) -> Dict[str, Any]:
+    """
+    Call OpenAI Responses (GPT-5 by default) to produce a JSON file manifest.
+    No 'temperature' param (GPT-5 rejects it in Responses).
+    """
+    client = get_openai_client()
+    if not client.enabled or not settings.openai_enabled:
+        return _fallback_scaffold(spec, reason="openai disabled")
+
+    spec_json = json.dumps(spec.model_dump(), ensure_ascii=False, indent=2)
+    input_text = _CODEGEN_USER_TEMPLATE.format(spec_json=spec_json)
+
+    model = (
+        getattr(settings, "omega_codegen_model", None)
+        or getattr(settings, "effective_codegen_model", None)
+        or settings.omega_llm_model
+    )
+
+    # Build request without unsupported params
+    req: Dict[str, Any] = {
+        "model": model,
+        "input": [
+            {"role": "system", "content": _CODEGEN_SYSTEM},
+            {"role": "user", "content": input_text},
+        ],
+        "max_output_tokens": 4000,
+        # NOTE: Do not include `temperature` or `response_format` here.
     }
 
-    files = [
-        ("index.html", idx_html),
-        ("styles.css", theme_dark_css),
-        ("main.js", main_js),
-        ("omega.spec.json", json.dumps(spec.model_dump(mode="json"), indent=2)),
-        ("package.json", json.dumps(pkg_json, indent=2)),
-        (".gitignore", "node_modules\n.dist\nbuild\n.DS_Store\n"),
-        ("README.md", f"# {name}\\n\\nGenerated by Omega Builder.\\n\\n## Run\\n\\n```bash\\nnpm i\\nnpm run dev\\n```"),
-    ]
-    return files
-
-def plan_files(spec: OmegaSpec, target: str = "react") -> List[Tuple[str, str]]:
-    target = (target or "react").lower()
-    if target == "react":
-        return _files_for_react(spec)
-    # If you add more targets here later, branch appropriately.
-    raise ValueError(f"unknown target: {target}")
-
-# --------------------------------------------------------------------------------------
-# Entry points
-# --------------------------------------------------------------------------------------
-
-def write_project(spec: OmegaSpec, workspace: Path, target: str = "react") -> Dict[str, Any]:
-    """
-    For React: write a fresh Vite skeleton into a timestamped staging dir,
-    promote it atomically, then run the web gate and return a manifest + gate.
-    For Flutter: this function does NOT write files; it only runs the compile-safe
-    gate against 'workspace/apps/omega-app' and returns that report.
-
-    This function also persists a compact "last run" file at the end so that
-    /api/last-run (and the HTML viewer) always has fresh data.
-    """
-    target_l = (target or "react").lower()
-
-    # For last-run persistence (set by job runner; fallback to 'manual')
-    job_id_env = os.getenv("OMEGA_JOB_ID") or "manual"
-
-    # We’ll fill these, then persist last_run in a finally-block.
-    result: Dict[str, Any] = {}
-    final_dir_str: str = ""
-    manifest_list: List[Dict[str, Any]] = []
-    gate_report: Dict[str, Any] | None = None
-
     try:
-        # React path — write build, then gate it
-        if target_l == "react":
-            root = _build_root(workspace)
-            slug = _slug(spec.name or "app")
-            ts = int(time.time())
-            staging = root / f"{slug}-{ts}"
-            staging.mkdir(parents=True, exist_ok=True)
+        resp = client._client.responses.create(**req)  # type: ignore[attr-defined]
+    except Exception as e:
+        return _fallback_scaffold(spec, reason=f"responses.create error: {type(e).__name__}: {e}")
 
-            files = plan_files(spec, target_l)
-            for rel, content in files:
-                p = staging / rel
-                p.parent.mkdir(parents=True, exist_ok=True)
-                p.write_text(content, encoding="utf-8")
-                manifest_list.append({"path": str(p.relative_to(staging)), "bytes": len(content.encode("utf-8"))})
+    # Extract text robustly
+    if hasattr(resp, "output_text") and isinstance(resp.output_text, str):
+        output_text = resp.output_text
+    else:
+        chunks: List[str] = []
+        for item in getattr(resp, "output", []) or []:
+            if getattr(item, "type", None) == "message":
+                for c in getattr(item, "content", []) or []:
+                    t = getattr(c, "text", None)
+                    if isinstance(t, str):
+                        chunks.append(t)
+        output_text = "".join(chunks)
 
-            # Promote to a stable name (canonical latest)
-            final_dir = root / slug
-            promote(staging, final_dir)
-            final_dir_str = str(final_dir)
-
-            # Run web gate on the final dir (same checks you already had)
-            gate_report = run_gates(final_dir, target="react")
-
-            result = {
-                "status": "ok",
-                "target": target_l,
-                "dir": final_dir_str,
-                "files": manifest_list,
-                "gate": gate_report,
-            }
-            return result  # normal return
-
-        # Flutter path — do NOT write here; ensure compile-safe app via gate
-        if target_l == "flutter":
-            app_dir = Path("workspace/apps/omega-app")
-            final_dir_str = str(app_dir)
-            gate_report = run_gates(app_dir, target="flutter")
-            result = {
-                "status": "ok",
-                "target": target_l,
-                "dir": final_dir_str,
-                "files": [],            # generation is handled elsewhere; we’re only gating
-                "gate": gate_report,
-            }
-            return result  # normal return
-
-        # Unknown target
-        raise ValueError(f"unknown target: {target}")
-
-    finally:
-        # Persist last run no matter what (best-effort)
+    # Parse the model output into a manifest
+    try:
+        manifest = json.loads(output_text)
+    except Exception:
         try:
-            diff = compute_workspace_diff_summary()  # -> {"summary": "...", "preview": "..."}
-            # Compact tool log entry so /api/last-run has relevant context even without a ctx
-            tool_log_entry = {
-                "name": "write_project",
-                "args": {"target": target_l},
-                "result": {
-                    "dir": final_dir_str,
-                    "files_written": len(manifest_list),
-                    "gate_ok": (gate_report or {}).get("ok") if gate_report else None,
-                },
-                "ts": int(time.time()),
-            }
-            save_last_run(
-                job_id_env,
-                summary=diff.get("summary", "(no summary)"),
-                diff_preview=diff.get("preview", ""),
-                tool_log=[tool_log_entry],
-            )
-        except Exception:
-            # We intentionally swallow persistence errors here to avoid breaking the job.
-            # The API / worker logs will still show tracebacks if logging is enabled.
-            pass
+            manifest = _extract_first_json_object(output_text)
+        except Exception as e2:
+            return _fallback_scaffold(spec, reason=f"bad manifest: {type(e2).__name__}")
+
+    if not isinstance(manifest, dict) or "files" not in manifest:
+        return _fallback_scaffold(spec, reason="invalid manifest shape")
+
+    return manifest
+
+
+def generate_artifacts(spec: OmegaSpec, staging_root: Path) -> Union[Dict[str, Any], List[Any]]:
+    staging_root = Path(staging_root)
+    staging_root.mkdir(parents=True, exist_ok=True)
+
+    manifest = _prompt_codegen(spec)
+    files = manifest.get("files", [])
+    written: List[Dict[str, str]] = []
+
+    for f in files:
+        path = str(f.get("path", "")).strip() if isinstance(f, dict) else str(f).strip()
+        contents = f.get("contents", "") if isinstance(f, dict) else ""
+        if not path:
+            continue
+        try:
+            rel_written = _safe_write(staging_root, path, contents)
+            written.append({"path": rel_written})
+        except Exception as e:
+            written.append({"path": path, "error": f"{type(e).__name__}: {e}"})
+
+    return {"files": written, "notes": manifest.get("notes", "")}
+
+
+def generate(spec: OmegaSpec, staging_root: Path) -> Union[Dict[str, Any], List[Any]]:
+    return generate_artifacts(spec, staging_root)

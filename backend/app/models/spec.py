@@ -1,358 +1,255 @@
+# backend/app/models/spec.py
 from __future__ import annotations
 
-import json
-import re
-from typing import Any, Dict, List, Literal, Optional
+from typing import Any, List, Optional, Union
 
-from pydantic import BaseModel, Field, field_validator, model_validator, AliasChoices
-
-
-# --- small helpers ---
-def _slugify(text: str) -> str:
-    t = (text or "").strip().lower()
-    t = re.sub(r"['\"`]+", "", t)
-    t = re.sub(r"[^a-z0-9]+", "-", t)
-    t = re.sub(r"-{2,}", "-", t).strip("-")
-    return t or "item"
+from pydantic import (
+    BaseModel,
+    Field,
+    ValidationError,
+    ConfigDict,
+    field_validator,
+    model_validator,
+)
 
 
-def _title_from_id_or_path(id_val: Optional[str], path: Optional[str]) -> str:
-    if id_val:
-        return id_val.replace("_", " ").replace("-", " ").title()
-    if path:
-        seg = path.strip("/").split("/")[-1]
-        seg = re.sub(r"[:{}]", "", seg)
-        return seg.replace("_", " ").replace("-", " ").title() or "Untitled"
-    return "Untitled"
+# ----------------------------
+# Atomic submodels
+# ----------------------------
 
+class Theme(BaseModel):
+    """Visual defaults for generated clients."""
+    model_config = ConfigDict(extra="ignore")
 
-def _action_dict_to_string(d: Dict[str, Any]) -> str:
-    if not isinstance(d, dict):
-        return str(d)
+    colors: List[str] = Field(default_factory=list, description="Optional brand color tokens.")
+    typography: List[str] = Field(default_factory=list, description="Optional font families or tokens.")
+    radius: List[int] = Field(default_factory=lambda: [8], description="Corner radii (list of ints).")
 
-    t = (d.get("type") or "").strip().lower()
-    if t == "navigate":
-        to = d.get("to") or d.get("path") or "/"
-        return f"nav:{to}"
-    if t == "api":
-        name = d.get("name") or d.get("endpoint") or d.get("id") or "api"
-        return f"api:{name}"
-    if t == "toast":
-        msg = d.get("message") or d.get("text") or ""
-        return f"toast:{msg}"
-
-    try:
-        return "json:" + json.dumps(d, separators=(",", ":"), ensure_ascii=False)
-    except Exception:
-        return str(d)
-
-
-# --- Tokens / Theme ---
-class ColorToken(BaseModel):
-    name: str
-    value: str
-    role: Optional[str] = None
-    model_config = {"extra": "ignore"}
-
-
-class TypographyToken(BaseModel):
-    name: str
-    font_family: str = Field(default="Inter")
-    size: int = Field(default=14)
-    weight: int = Field(default=400)
-    line_height: Optional[int] = None
-    model_config = {"extra": "ignore"}
-
-
-# --- Entities & APIs ---
-class FieldDef(BaseModel):
-    name: str
-    type: Literal["string", "int", "double", "bool", "image", "date", "list", "map"] = "string"
-    required: bool = False
-    model_config = {"extra": "ignore"}
-
-
-class Entity(BaseModel):
-    name: str
-    fields: List[FieldDef]
-    model_config = {"extra": "ignore"}
-
-
-class Endpoint(BaseModel):
-    method: Optional[Literal["GET", "POST", "PUT", "PATCH", "DELETE"]] = None
-    path: str
-    mock_file: Optional[str] = None
-    model_config = {"extra": "ignore"}
-
-
-class ApiDef(BaseModel):
-    """
-    Flexible API shape:
-    - Accepts `id` OR `name` (stored in `name`)
-    - `endpoints` may be:
-        * dict[str, Endpoint]
-        * list[str]                            -> paths
-        * list[dict{ name/id/operationId, ...}] -> normalized to Endpoint
-    - Single-endpoint shortcut via `method` + `path`
-    """
-    name: str = Field(default="", validation_alias=AliasChoices("name", "id"), description="API name")
-    base_url: Optional[str] = None
-    mock_file: Optional[str] = None
-    endpoints: Dict[str, Endpoint] = Field(default_factory=dict)
-    method: Optional[str] = None
-    path: Optional[str] = None
-
-    @field_validator("endpoints", mode="before")
+    @field_validator("colors")
     @classmethod
-    def _normalize_endpoints_before(cls, v):
+    def _colors_are_strings(cls, v: Any) -> List[str]:
+        if not isinstance(v, list):
+            raise ValueError("theme.colors must be a list of strings")
+        if any(not isinstance(x, str) or not x.strip() for x in v):
+            raise ValueError("theme.colors entries must be non-empty strings")
+        return [x.strip() for x in v]
+
+    @field_validator("typography")
+    @classmethod
+    def _typography_are_strings(cls, v: Any) -> List[str]:
+        if not isinstance(v, list):
+            raise ValueError("theme.typography must be a list of strings")
+        if any(not isinstance(x, str) or not x.strip() for x in v):
+            raise ValueError("theme.typography entries must be non-empty strings")
+        return [x.strip() for x in v]
+
+    @field_validator("radius", mode="before")
+    @classmethod
+    def _coerce_radius_before(cls, v: Any) -> List[int]:
+        """
+        Accepts:
+          - int/float -> [int]
+          - list of numbers -> list[int]
+        Rejects anything else with a short error. We clamp to [0, 64].
+        """
         if v is None:
-            return {}
-        # dict -> keep but coerce inner values
-        if isinstance(v, dict):
-            out = {}
-            for key, val in v.items():
-                if isinstance(val, str):
-                    out[key] = {"path": val}
-                elif isinstance(val, dict):
-                    out[key] = {
-                        "method": val.get("method") or val.get("http_method") or val.get("verb"),
-                        "path": val.get("path") or val.get("url") or val.get("route") or val.get("endpoint") or "/",
-                        "mock_file": val.get("mock_file") or val.get("mock"),
-                    }
-                else:
-                    out[key] = {"path": str(val)}
-            return out
-        # list -> convert to dict with stable keys
+            return [8]
+        if isinstance(v, (int, float)):
+            iv = int(v)
+            return [max(0, min(64, iv))]
         if isinstance(v, list):
-            out: Dict[str, Dict[str, Any]] = {}
-            for i, item in enumerate(v, start=1):
-                if isinstance(item, str):
-                    key = f"ep{i}"
-                    out[key] = {"path": item}
-                    continue
-                if isinstance(item, dict):
-                    key = (
-                        item.get("key")
-                        or item.get("name")
-                        or item.get("id")
-                        or item.get("operationId")
-                        or f"ep{i}"
-                    )
-                    out[key] = {
-                        "method": item.get("method") or item.get("http_method") or item.get("verb"),
-                        "path": item.get("path") or item.get("url") or item.get("route") or item.get("endpoint") or "/",
-                        "mock_file": item.get("mock_file") or item.get("mock"),
-                    }
-                    continue
-                # fallback
-                out[f"ep{i}"] = {"path": str(item)}
+            out: List[int] = []
+            for i, item in enumerate(v):
+                if not isinstance(item, (int, float)):
+                    raise ValueError(f"theme.radius[{i}] must be an integer")
+                iv = int(item)
+                out.append(max(0, min(64, iv)))
             return out
+        raise ValueError("theme.radius must be a list of integers")
+
+    @field_validator("radius")
+    @classmethod
+    def _radius_nonempty(cls, v: List[int]) -> List[int]:
+        if not v:
+            raise ValueError("theme.radius must have at least one integer")
         return v
 
-    def model_post_init(self, __ctx) -> None:  # type: ignore[override]
-        if not self.endpoints and self.path:
-            key = (self.method or "get").lower()
-            key = f"{key}_{(self.name or '').strip()}" or key
-            self.endpoints = {
-                key: Endpoint(method=self.method, path=self.path, mock_file=self.mock_file)
-            }
 
-    model_config = {"extra": "ignore"}
+class NavLink(BaseModel):
+    """Navigation entry object form. Strings are also allowed at Navigation.items."""
+    model_config = ConfigDict(extra="ignore")
 
+    id: str = Field(..., description="Route id, e.g., 'home' or 'products'.")
+    title: Optional[str] = Field(default=None, description="Display label. Defaults to title-cased id.")
 
-# --- Navigation ---
-_ALLOWED_TEMPLATES = {"list", "detail", "cart", "orders", "profile", "seller_form", "search"}
-
-
-class NavItem(BaseModel):
-    # accept either "id" or "name"
-    id: str = Field(default="", validation_alias=AliasChoices("id", "name"))
-    title: Optional[str] = None
-    template: str = "list"
-    data_source: Optional[str] = None
-    item_fields: Optional[List[str]] = None
-    actions: Optional[List[str]] = None
-    path: Optional[str] = None
-    endpoint: Optional[str] = None
-
-    @field_validator("template", mode="before")
+    @field_validator("id")
     @classmethod
-    def _coerce_template(cls, v: str) -> str:
-        if not isinstance(v, str):
-            return "list"
-        vv = v.lower().strip()
-        if vv == "grid":
-            return "list"
-        return vv if vv in _ALLOWED_TEMPLATES else "list"
-
-    @field_validator("actions", mode="before")
-    @classmethod
-    def _normalize_actions(cls, v):
-        if v is None:
-            return None
-        out: List[str] = []
-        if isinstance(v, list):
-            for it in v:
-                if isinstance(it, str):
-                    out.append(it)
-                elif isinstance(it, dict):
-                    out.append(_action_dict_to_string(it))
-                else:
-                    out.append(str(it))
-            return out or None
-        if isinstance(v, dict):
-            return [_action_dict_to_string(v)]
-        return [str(v)]
-
-    @model_validator(mode="before")
-    @classmethod
-    def _fill_id_from_other_fields(cls, data):
-        if isinstance(data, dict):
-            cur = data.get("id")
-            if not cur or not str(cur).strip():
-                candidate = data.get("name") or data.get("path") or data.get("title")
-                data["id"] = _slugify(str(candidate) if candidate else "item")
-        return data
+    def _id_required(cls, v: str) -> str:
+        v = (v or "").strip()
+        if not v:
+            raise ValueError("navigation.items[].id is required")
+        return v
 
     @model_validator(mode="after")
-    def _ensure_title(self):
-        if not self.title or not self.title.strip():
-            self.title = _title_from_id_or_path(self.id, self.path)
+    def _default_title(self) -> "NavLink":
+        if not self.title:
+            self.title = self.id.replace("-", " ").replace("_", " ").title()
         return self
-
-    model_config = {"extra": "ignore"}
 
 
 class Navigation(BaseModel):
-    home: str
-    items: List[NavItem]
+    """Top-level navigation config."""
+    model_config = ConfigDict(extra="ignore")
 
-    @field_validator("home", mode="before")
-    @classmethod
-    def _coerce_home(cls, v):
-        # treat blank as missing
-        if isinstance(v, str):
-            return v if v.strip() else "home"
-        if isinstance(v, dict):
-            cand = v.get("id") or v.get("name")
-            if not cand:
-                cand = _slugify(v.get("path") or v.get("title") or "home")
-            return str(cand)
-        if isinstance(v, list) and v:
-            it = v[0]
-            if isinstance(it, str):
-                return it
-            if isinstance(it, dict):
-                return cls._coerce_home(it)
-        return "home"
+    home: str = Field(default="home", description="Default route id to launch on app start.")
+    items: List[Union[str, NavLink]] = Field(default_factory=list, description="Nav items: strings or objects.")
 
-    @field_validator("items", mode="before")
+    @field_validator("home")
     @classmethod
-    def _normalize_items_list(cls, v):
-        if v is None:
-            return []
-        if isinstance(v, dict):
-            out = []
-            for k, val in v.items():
-                if isinstance(val, dict):
-                    val = {"id": val.get("id") or k, **val}
-                else:
-                    val = {"id": k, "title": str(val)}
-                out.append(val)
-            return out
-        if isinstance(v, list):
-            out = []
-            for it in v:
-                if isinstance(it, str):
-                    out.append({"id": _slugify(it), "title": it})
-                elif isinstance(it, dict):
-                    if not it.get("id") or not str(it.get("id")).strip():
-                        it["id"] = _slugify(it.get("name") or it.get("path") or it.get("title") or "item")
-                    out.append(it)
-                else:
-                    out.append({"id": "item", "title": str(it)})
-            return out
+    def _home_non_empty(cls, v: str) -> str:
+        v = (v or "").strip()
+        if not v:
+            raise ValueError("navigation.home must be a non-empty string")
         return v
 
     @model_validator(mode="after")
-    def _ensure_home_in_items(self):
-        # ensure all item ids are non-empty
-        for it in self.items:
-            if not it.id or not it.id.strip():
-                it.id = _slugify(it.title or it.path or "item")
-
-        if self.items:
-            ids = [it.id for it in self.items if it.id]
-            if not self.home or not str(self.home).strip():
-                self.home = ids[0]
-            elif self.home not in ids:
-                slug_map = {_slugify(x): x for x in ids}
-                self.home = slug_map.get(_slugify(self.home), ids[0])
-        else:
-            self.home = "home"
+    def _validate_items(self) -> "Navigation":
+        # Ensure each item is either a non-empty string or a NavLink with id
+        for idx, it in enumerate(self.items):
+            if isinstance(it, str):
+                if not it.strip():
+                    raise ValueError(f"navigation.items[{idx}] must be a non-empty string")
+            elif isinstance(it, NavLink):
+                # NavLink already validated
+                pass
+            else:
+                raise ValueError(
+                    f"navigation.items[{idx}] must be a string route id or an object with 'id'"
+                )
         return self
 
-    model_config = {"extra": "ignore"}
 
+class Entity(BaseModel):
+    """Domain entity (kept permissive; only id required)."""
+    model_config = ConfigDict(extra="ignore")
 
-# --- Acceptance tests ---
-class AcceptanceCase(BaseModel):
-    id: Optional[str] = None
-    description: Optional[str] = None
+    id: str = Field(..., description="Entity identifier, e.g., 'product'.")
 
-    @model_validator(mode="before")
+    @field_validator("id")
     @classmethod
-    def _accept_desc_aliases(cls, data):
-        if isinstance(data, dict):
-            if "description" not in data or not data.get("description"):
-                desc = data.get("title") or data.get("desc") or data.get("details")
-                if desc:
-                    data["description"] = desc
-        return data
+    def _entity_id_required(cls, v: str) -> str:
+        v = (v or "").strip()
+        if not v:
+            raise ValueError("entities[].id is required")
+        return v
+
+
+class API(BaseModel):
+    """External or internal API definition (permissive)."""
+    model_config = ConfigDict(extra="ignore")
+
+    id: str = Field(..., description="API identifier, e.g., 'catalog'.")
+
+    @field_validator("id")
+    @classmethod
+    def _api_id_required(cls, v: str) -> str:
+        v = (v or "").strip()
+        if not v:
+            raise ValueError("apis[].id is required")
+        return v
+
+
+class AcceptanceItem(BaseModel):
+    """Human-readable acceptance checks, e.g., health checks."""
+    model_config = ConfigDict(extra="ignore")
+
+    id: str = Field(..., description="Stable id, kebab-case recommended.")
+    description: str = Field(..., description="Short description of the check.")
+
+    @field_validator("id")
+    @classmethod
+    def _acc_id_required(cls, v: str) -> str:
+        v = (v or "").strip()
+        if not v:
+            raise ValueError("acceptance[].id is required")
+        return v
+
+    @field_validator("description")
+    @classmethod
+    def _acc_desc_required(cls, v: str) -> str:
+        v = (v or "").strip()
+        if not v:
+            raise ValueError("acceptance[].description is required")
+        return v
+
+
+# ----------------------------
+# Root model
+# ----------------------------
+
+class OmegaSpec(BaseModel):
+    """
+    Minimal, adaptive spec for Omega Builder.
+    Keep it lean (not template-oriented) but structurally sound.
+    """
+    model_config = ConfigDict(extra="ignore")
+
+    name: str = Field(default="Omega App", description="Project name.")
+    description: str = Field(default="OmegaSpec derived from brief.", description="Short description.")
+    theme: Theme = Field(default_factory=Theme)
+    navigation: Navigation = Field(default_factory=Navigation)
+    entities: List[Entity] = Field(default_factory=list)
+    apis: List[API] = Field(default_factory=list)
+    acceptance: List[AcceptanceItem] = Field(default_factory=list)
+
+    @field_validator("name")
+    @classmethod
+    def _name_non_empty(cls, v: str) -> str:
+        v = (v or "").strip()
+        if not v:
+            raise ValueError("name must be a non-empty string")
+        return v
+
+    @field_validator("description")
+    @classmethod
+    def _desc_non_empty(cls, v: str) -> str:
+        v = (v or "").strip()
+        if not v:
+            raise ValueError("description must be a non-empty string")
+        return v
 
     @model_validator(mode="after")
-    def _ensure_id_and_desc(self):
-        if not self.description:
-            self.description = "Acceptance criterion"
-        if not self.id:
-            self.id = _slugify(self.description)[:64]
+    def _acceptance_non_empty(self) -> "OmegaSpec":
+        if not self.acceptance:
+            # Keep error short and actionable to help O3 repair loops
+            raise ValueError("acceptance must contain at least one check item")
         return self
 
-    model_config = {"extra": "ignore"}
 
+# ----------------------------
+# Public API
+# ----------------------------
 
-# --- Root Spec ---
-class OmegaSpec(BaseModel):
-    name: str
-    description: Optional[str] = None
-    theme: Dict[str, List] = Field(default_factory=lambda: {"colors": [], "typography": []})
-    entities: List[Entity] = Field(default_factory=list)
-    apis: List[ApiDef] = Field(default_factory=list)
-    navigation: Navigation
-    acceptance: List[AcceptanceCase] = Field(default_factory=list)
-    model_config = {"extra": "ignore"}
-
-
-def validate_spec(obj: dict) -> OmegaSpec:
+def _short_pydantic_error(err: ValidationError) -> str:
     """
-    Validate raw dict into OmegaSpec.
+    Render Pydantic errors as short, actionable lines:
+      - path: message
+    This keeps messages compact for O3 self-repair loops.
     """
-    theme = obj.get("theme", {})
-    colors = theme.get("colors", [])
-    typography = theme.get("typography", [])
+    lines: List[str] = []
+    for e in err.errors():
+        loc = ".".join(str(p) for p in e.get("loc", ())) or "<root>"
+        msg = e.get("msg", "invalid value")
+        lines.append(f"{loc}: {msg}")
+    return "Spec validation failed:\n" + "\n".join(f"- {ln}" for ln in lines)
 
-    def _coerce_list(items, model):
-        out: List = []
-        for it in items or []:
-            try:
-                out.append(model.model_validate(it))
-            except Exception:
-                out.append(it)
-        return out
 
-    if isinstance(theme, dict):
-        theme["colors"] = _coerce_list(colors, ColorToken)
-        theme["typography"] = _coerce_list(typography, TypographyToken)
-        obj["theme"] = theme
-
-    return OmegaSpec.model_validate(obj)
+def validate_spec(data: Any) -> OmegaSpec:
+    """
+    Validate/normalize a raw spec dict into OmegaSpec.
+    Raises ValueError with short, actionable messages on failure.
+    """
+    try:
+        return OmegaSpec.model_validate(data)
+    except ValidationError as e:
+        raise ValueError(_short_pydantic_error(e)) from e

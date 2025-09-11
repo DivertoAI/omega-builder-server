@@ -1,4 +1,6 @@
-.DS_Store
-._*
-.git
-workspace
+# keep the build context tiny
+*
+!docker/
+!scripts/
+!app/
+!.dockerignore
