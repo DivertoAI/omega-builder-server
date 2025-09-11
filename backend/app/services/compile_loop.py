@@ -13,6 +13,10 @@ from typing import Dict, List, Optional
 # Allow override via env; default to 'flutter' on PATH
 FLUTTER_BIN = os.getenv("FLUTTER_BIN", "flutter")
 
+# Comma-separated desired platforms (created if missing)
+# e.g. "macos,ios,android" — default to macOS since that's what often fails locally
+DEFAULT_PLATFORMS = [p.strip() for p in os.getenv("OMEGA_FLUTTER_PLATFORMS", "macos").split(",") if p.strip()]
+
 @dataclass
 class CmdResult:
     cmd: str
@@ -321,6 +325,52 @@ void main() {
     return [f for f in fixes if f]
 
 # ---------------------------
+# Platform scaffolding (new)
+# ---------------------------
+
+def _platform_dir_for(platform: str) -> str:
+    # Map platform name to the directory Flutter creates in project root
+    return {
+        "macos": "macos",
+        "ios": "ios",
+        "android": "android",
+        "linux": "linux",
+        "windows": "windows",
+        "web": "web",
+      }.get(platform, platform)
+
+def _ensure_platform_scaffold(app_dir: Path, platforms: List[str], timeout: int = 600) -> List[str]:
+    """
+    If a requested platform directory is missing, run:
+        flutter create . --platforms=<comma-separated>
+    Returns a list of actions taken (for logging).
+    """
+    actions: List[str] = []
+    need: List[str] = []
+    for p in platforms:
+        plat = p.strip().lower()
+        if not plat:
+            continue
+        plat_dir = app_dir / _platform_dir_for(plat)
+        if not plat_dir.exists():
+            need.append(plat)
+
+    if need:
+        _log(f"platform: ensuring scaffold for {need}")
+        # Flutter allows multiple platforms in one create
+        cmd = [FLUTTER_BIN, "create", ".", f"--platforms={','.join(need)}"]
+        try:
+            res = _run(cmd, app_dir, timeout=timeout)
+            if res.rc == 0:
+                actions.append(f"flutter create . --platforms={','.join(need)}")
+            else:
+                actions.append(f"platform create failed (rc={res.rc})")
+                _log(f"platform create stderr:\n{res.stderr}")
+        except FileNotFoundError:
+            actions.append("flutter not found while creating platforms")
+    return actions
+
+# ---------------------------
 # macOS cruft cleaner
 # ---------------------------
 
@@ -364,14 +414,17 @@ def run_compile_loop(
     test_timeout_first_sec: int = 900,
     test_timeout_sec: int = 360,
     watchdog_idle_sec: int = 60,
+    # new: platforms to ensure (defaults via env)
+    platforms: Optional[List[str]] = None,
 ) -> CompileReport:
     """
     Runs flutter analyze (+ tests) in a loop; applies safe fixes and retries.
     Strategy:
+      - Ensure requested platform scaffolds exist (e.g., macos/) before analyze.
       - Round 1: run ONLY smoke test (fast feedback, prevents suite discovery hang).
       - Once smoke passes, later rounds may run the full test suite.
       - Uses --machine output with an idle watchdog for tests.
-      - **NEW**: Purges macOS AppleDouble (. _*) and .DS_Store files under test/ each round.
+      - Purges macOS AppleDouble (. _*) and .DS_Store files under test/ each round.
     """
     app_dir = app_dir.resolve()
     _log(f"compile_loop: app_dir={app_dir}")
@@ -381,6 +434,11 @@ def run_compile_loop(
     ok_overall = False
     message = ""
     full_suite_allowed = False  # flips true after smoke passes at least once
+
+    # Ensure platform scaffolds first (common cause of "No macOS desktop project configured")
+    desired_platforms = platforms if platforms is not None else DEFAULT_PLATFORMS
+    if desired_platforms:
+        _ = _ensure_platform_scaffold(app_dir, desired_platforms, timeout=max(test_timeout_first_sec, 600))
 
     if run_pub_get_first:
         try:

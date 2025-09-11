@@ -1,22 +1,39 @@
+# omega-builder/docker/Dockerfile
 FROM python:3.11-slim
 
 WORKDIR /app
 
-# System deps (curl for healthcheck; build tools only if needed)
-RUN apt-get update && apt-get install -y --no-install-recommends curl && rm -rf /var/lib/apt/lists/*
+# Minimal system deps (curl for healthcheck/log checks)
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends curl \
+    && rm -rf /var/lib/apt/lists/*
 
-# Copy project metadata first (leverages Docker cache for deps)
-COPY pyproject.toml /app/
-# If you have a lock file (like poetry.lock/requirements.txt), copy and install that too.
+# Environment for noiseless logs & imports
+ENV PYTHONUNBUFFERED=1 \
+    PYTHONPATH=/app
 
-# Install Python deps + redis client
-RUN pip install --no-cache-dir --upgrade pip && \
-    pip install --no-cache-dir -e . && \
-    pip install --no-cache-dir "redis>=5"
+# ---- Copy project metadata first (cache-friendly) ----
+# If your package is defined in pyproject.toml (it is), we still need the source
+# for an editable install, but copying these first keeps later layers cached.
+COPY pyproject.toml README.md ./
 
-# Copy the rest of the source
-COPY . /app
+# ---- Copy source that the package exposes ----
+# (Editable install needs the actual package code present.)
+COPY backend backend
+COPY cli cli
+
+# If you have any top-level modules or entrypoints, copy them too
+# COPY scripts scripts
+
+# ---- Install Python deps ----
+# - Upgrade pip
+# - Editable install of this repo (pulls deps from pyproject.toml)
+# - Ensure redis client is present (belt & suspenders; pyproject already includes it)
+RUN python -m pip install --no-cache-dir --upgrade pip \
+    && python -m pip install --no-cache-dir -e . \
+    && python -m pip install --no-cache-dir "redis>=5"
 
 EXPOSE 8000
 
-CMD ["uvicorn", "backend.main:app", "--host", "0.0.0.0", "--port", "8000"]
+# Uvicorn entrypoint
+CMD ["python", "-m", "uvicorn", "backend.main:app", "--host", "0.0.0.0", "--port", "8000"]

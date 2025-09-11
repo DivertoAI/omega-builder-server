@@ -1,8 +1,9 @@
 FROM ubuntu:22.04
 
-# Basic deps (keep small but sufficient)
+# Basic deps for Flutter + worker
 RUN apt-get update && apt-get install -y --no-install-recommends \
   git curl unzip xz-utils zip ca-certificates libglu1-mesa \
+  python3 python3-pip jq redis-tools dumb-init \
   && rm -rf /var/lib/apt/lists/*
 
 ARG FLUTTER_VERSION=3.27.1
@@ -18,18 +19,29 @@ WORKDIR /home/flutter
 RUN git clone --depth 1 --branch ${FLUTTER_VERSION} https://github.com/flutter/flutter.git ${FLUTTER_HOME}
 ENV PATH="${FLUTTER_HOME}/bin:${PUB_CACHE}/bin:${PATH}" \
   PUB_CACHE="${PUB_CACHE}" \
-  CI=true
+  CI=true \
+  WORKSPACE_DIR="/workspace" \
+  REDIS_URL="redis://redis:6379/0"
 
-# Lightweight verify (no precache here to avoid overlayfs write issues)
+# Smoke (keep layers small)
 RUN flutter --version && flutter config --enable-web || true
 
-# Switch to workspace mount at runtime
+# Install Python deps for the API
+USER root
+RUN python3 -m pip install --no-cache-dir fastapi "uvicorn[standard]" pydantic==2.* \
+  && chmod 755 /usr/local/bin
+USER flutter
+
+# Mount point for repo
 WORKDIR /workspace
 
-# Copy helper (make sure this path exists in build context)
+# Copy worker
 USER root
-COPY ./scripts/job_runner.sh /scripts/job_runner.sh
+COPY scripts/job_runner.sh /scripts/job_runner.sh
 RUN chmod +x /scripts/job_runner.sh
 USER flutter
 
-CMD ["/bin/bash"]
+# Run the Redis worker + FastAPI
+# NOTE: we `cd /workspace/ai-vm` so `uvicorn app.main:app` resolves (folder is 'ai-vm', not 'ai_vm')
+ENTRYPOINT ["dumb-init", "--"]
+CMD ["/bin/bash","-lc","bash /scripts/job_runner.sh & python3 -m uvicorn main:app --host 0.0.0.0 --port 8080 --app-dir /workspace/ai-vm/app"]
