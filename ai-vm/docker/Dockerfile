@@ -35,13 +35,13 @@ USER flutter
 # Mount point for repo
 WORKDIR /workspace
 
-# Copy worker
+# Prepare /scripts and copy worker with correct perms/ownership
 USER root
-COPY scripts/job_runner.sh /scripts/job_runner.sh
-RUN chmod +x /scripts/job_runner.sh
+RUN install -d -m 0755 -o flutter -g flutter /scripts
+COPY --chown=flutter:flutter --chmod=0755 scripts/job_runner.sh /scripts/job_runner.sh
 USER flutter
 
 # Run the Redis worker + FastAPI
-# NOTE: we `cd /workspace/ai-vm` so `uvicorn app.main:app` resolves (folder is 'ai-vm', not 'ai_vm')
+# NOTE: app dir is /workspace/ai-vm/app (folder is 'ai-vm', not 'ai_vm')
 ENTRYPOINT ["dumb-init", "--"]
 CMD ["/bin/bash","-lc","bash /scripts/job_runner.sh & python3 -m uvicorn main:app --host 0.0.0.0 --port 8080 --app-dir /workspace/ai-vm/app"]
