@@ -30,10 +30,11 @@ services:
       # Ensure omega writes artifacts where ai-vm can see them
       OMEGA_STAGING_ROOT: "/workspace/staging"
 
-      # Use the SAME queue name as the AI-VM worker
+      # Queues (build + assets) — must match ai-vm
       AI_VM_QUEUE_KEY: "queue:build"
+      AI_VM_QUEUE_ASSETS: "queue:assets"
 
-      # Optional safety/time caps (tweak as needed)
+      # Optional safety/time caps
       OMEGA_MAX_AGENT_ROUNDS: "8"
       OMEGA_DEFAULT_WALL_CLOCK_SEC: "900"
     volumes:
@@ -48,7 +49,7 @@ services:
     stdin_open: true
     restart: unless-stopped
     healthcheck:
-      test: ["CMD", "curl", "-fsS", "http://localhost:8000/health"]
+      test: ["CMD", "curl", "-fsS", "http://localhost:8000/api/health"]
       interval: 2m
       timeout: 5s
       retries: 1
@@ -75,17 +76,27 @@ services:
       CI: "true"
       REDIS_URL: "redis://redis:6379/0"
 
-      # Use the SAME queue name as omega enqueues to
+      # Queues (build + assets) — must match omega
       AI_VM_QUEUE_KEY: "queue:build"
+      AI_VM_QUEUE_ASSETS: "queue:assets"
+
+      # Image model for assets worker
+      OMEGA_IMAGE_MODEL: "gpt-image-1"
     volumes:
       # Mount the repo at /workspace so the VM can act on the generated app
       - .:/workspace:delegated
       # Cache pub packages & Gradle between runs (improves speed)
       - ai_vm_pub_cache:/home/flutter/.pub-cache
       - ai_vm_gradle_cache:/home/flutter/.gradle
+    command: >
+      bash -lc '
+        # start the API
+        uvicorn app.main:app --host 0.0.0.0 --port 8080 &
+        # start the assets worker (logs to stdout)
+        exec python -u workers/assets_worker.py
+      '
     restart: unless-stopped
     healthcheck:
-      # Slow and simple health check; not related to OpenAI billing
       test: ["CMD", "curl", "-fsS", "http://localhost:8080/api/health"]
       interval: 2m
       timeout: 8s
