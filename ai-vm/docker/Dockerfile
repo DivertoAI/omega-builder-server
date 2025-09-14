@@ -25,7 +25,10 @@ RUN --mount=type=cache,target=/var/cache/apt \
   python3 python3-pip \
   redis-tools dumb-init \
   # Flutter Linux desktop toolchain bits (and GL)
-  clang cmake ninja-build pkg-config libglu1-mesa libgl1; \
+  clang cmake ninja-build pkg-config libglu1-mesa libgl1 \
+  # JDK for Android tools later
+  openjdk-17-jdk-headless; \
+  ln -sf /usr/bin/python3 /usr/local/bin/python; \
   rm -rf /var/lib/apt/lists/*
 
 # ----------------------------
@@ -61,13 +64,18 @@ RUN --mount=type=cache,target=/home/flutter/.pub-cache \
   flutter precache --android --linux --force || true
 
 # ----------------------------
-# API Python dependencies
+# API & worker Python dependencies
 # ----------------------------
 USER root
-RUN python3 -m pip install --no-cache-dir \
+RUN python -m pip install --no-cache-dir \
   fastapi==0.116.1 \
   "uvicorn[standard]==0.30.5" \
   "pydantic==2.*" \
+  aiofiles==23.* \
+  rich==13.* \
+  redis==5.* \
+  openai==1.* \
+  python-dotenv==1.* \
   && chmod 755 /usr/local/bin
 
 # ----------------------------
@@ -77,27 +85,22 @@ ENV ANDROID_SDK_ROOT=/opt/android-sdk \
   ANDROID_HOME=/opt/android-sdk
 ENV PATH="${PATH}:${ANDROID_SDK_ROOT}/cmdline-tools/latest/bin:${ANDROID_SDK_ROOT}/platform-tools:${ANDROID_SDK_ROOT}/build-tools/34.0.0"
 
-# OpenJDK + Google cmdline-tools + required SDKs
+# Google cmdline-tools + required SDKs
 RUN --mount=type=cache,target=/var/cache/apt \
   --mount=type=cache,target=/var/lib/apt/lists \
   set -eux; \
   apt-get -o Acquire::Retries=5 -o Acquire::http::Timeout=30 update; \
-  apt-get install -y --no-install-recommends openjdk-17-jdk-headless; \
   rm -rf /var/lib/apt/lists/*; \
-  \
   mkdir -p "${ANDROID_SDK_ROOT}/cmdline-tools"; \
   curl -fsSL -o /tmp/cmdtools.zip "https://dl.google.com/android/repository/commandlinetools-linux-11076708_latest.zip"; \
   unzip -q /tmp/cmdtools.zip -d "${ANDROID_SDK_ROOT}/cmdline-tools"; \
   mv "${ANDROID_SDK_ROOT}/cmdline-tools/cmdline-tools" "${ANDROID_SDK_ROOT}/cmdline-tools/latest"; \
   rm -f /tmp/cmdtools.zip; \
-  \
   yes | sdkmanager --sdk_root="${ANDROID_SDK_ROOT}" --licenses; \
   sdkmanager --sdk_root="${ANDROID_SDK_ROOT}" \
   "platform-tools" \
   "build-tools;34.0.0" \
   "platforms;android-34"; \
-  \
-  # Ensure 'flutter' owns the SDK
   chown -R flutter:flutter "${ANDROID_SDK_ROOT}"
 
 # ----------------------------
@@ -117,4 +120,4 @@ USER flutter
 # ----------------------------
 # NOTE: app dir is /workspace/ai-vm/app (folder is 'ai-vm', not 'ai_vm')
 ENTRYPOINT ["dumb-init", "--"]
-CMD ["/bin/bash","-lc","bash /scripts/job_runner.sh & python3 -m uvicorn main:app --host 0.0.0.0 --port 8080 --app-dir /workspace/ai-vm/app"]
+CMD ["/bin/bash","-lc","bash /scripts/job_runner.sh & python -m uvicorn main:app --host 0.0.0.0 --port 8080 --app-dir /workspace/ai-vm/app"]

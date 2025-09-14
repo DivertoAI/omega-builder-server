@@ -1,33 +1,18 @@
-FlutterListDetailApp
+# Hello Button App
 
-A minimal Flutter app that shows a list on the home screen and a detail screen for each item. Includes a simple health endpoint service returning "ok".
+A minimal single-screen Flutter app that displays "Hello" text and a button.
 
-Requirements
-- Flutter SDK (3.x+) and Dart SDK (3.x+)
+Run (Web):
+- Ensure Flutter SDK is installed and Chrome is available.
+- From the project root:
+  1. flutter pub get
+  2. flutter run -d chrome
 
-Getting Started (App)
-1) Initialize platform folders (once):
-   flutter create --project-name flutter_list_detail_app .
-2) Install dependencies:
-   flutter pub get
-3) Run the app:
-   flutter run
+Health endpoint (acceptance):
+- When running on web, the dev server serves a static health endpoint.
+- Copy the local URL printed by Flutter (e.g., http://localhost:12345), then open or curl:
+  - curl http://localhost:12345/health
+- Expected response: "ok"
 
-Routes
-- /                Home list
-- /items/:id       Detail for item with the given id (e.g., /items/3)
-
-Health Endpoint Service
-A minimal Dart HTTP server exposing GET /health -> 200 ok.
-
-Run:
-  dart bin/health_server.dart
-
-Test:
-  curl -i http://localhost:8080/health
-  HTTP/1.1 200 OK
-  ok
-
-Notes
-- The health server binds to localhost:8080 by default. Set PORT env var to override.
-- The server is independent of the Flutter app and can be used for basic liveness checks.
+Notes:
+- The app defines a single route named "/home" matching the spec's navigation.home.

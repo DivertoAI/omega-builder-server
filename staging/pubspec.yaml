@@ -1,11 +1,10 @@
-name: flutter_list_detail
-description: A Flutter app that displays a list on the home screen and a detail screen for each item.
-publish_to: 'none'
-version: 0.1.0
+name: hello_button_app
+description: A minimal single-screen Flutter app that displays 'Hello' text and a button.
+publish_to: "none"
+version: 1.0.0+1
 
 environment:
-  sdk: ">=3.3.0 <4.0.0"
-  flutter: ">=3.19.0"
+  sdk: ">=3.0.0 <4.0.0"
 
 dependencies:
   flutter:

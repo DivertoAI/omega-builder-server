@@ -1,3 +1,5 @@
+# version: "3.9"
+
 services:
   omega:
     build:
@@ -23,9 +25,9 @@ services:
       REDIS_URL: "redis://redis:6379/0"
 
       # ==== AI-VM wiring (remote compile/repair) ====
-      OMEGA_COMPILE_REMOTE: "1"           # prefer AI-VM for compile/test/repair
-      OMEGA_COMPILE_LOCAL_FALLBACK: "1"   # if remote fails, fall back to local
-      AI_VM_URL: "http://ai-vm:8080"      # service DNS inside compose network
+      OMEGA_COMPILE_REMOTE: "1"
+      OMEGA_COMPILE_LOCAL_FALLBACK: "1"
+      AI_VM_URL: "http://ai-vm:8080"
 
       # Ensure omega writes artifacts where ai-vm can see them
       OMEGA_STAGING_ROOT: "/workspace/staging"
@@ -39,7 +41,7 @@ services:
       OMEGA_DEFAULT_WALL_CLOCK_SEC: "900"
     volumes:
       - .:/app:delegated
-      - .:/workspace:delegated          # shared path visible to both omega and ai-vm
+      - .:/workspace:delegated
       - omega_workspace:/app/workspace/.omega
     command: >
       python -m uvicorn backend.main:app
@@ -67,12 +69,11 @@ services:
     container_name: omega-ai-vm
     ports:
       - "8080:8080"
+    env_file:
+      - .env
     environment:
-      # where the VM expects to see the repo/workspace
       WORKSPACE_DIR: "/workspace"
-      # flutter version can be overridden at build arg time too
       FLUTTER_VERSION: "3.27.1"
-      # reduce tool noise in CI-like runs
       CI: "true"
       REDIS_URL: "redis://redis:6379/0"
 
@@ -83,17 +84,13 @@ services:
       # Image model for assets worker
       OMEGA_IMAGE_MODEL: "gpt-image-1"
     volumes:
-      # Mount the repo at /workspace so the VM can act on the generated app
       - .:/workspace:delegated
-      # Cache pub packages & Gradle between runs (improves speed)
       - ai_vm_pub_cache:/home/flutter/.pub-cache
       - ai_vm_gradle_cache:/home/flutter/.gradle
     command: >
       bash -lc '
-        # start the API
-        uvicorn app.main:app --host 0.0.0.0 --port 8080 &
-        # start the assets worker (logs to stdout)
-        exec python -u workers/assets_worker.py
+        python3 -m uvicorn main:app --host 0.0.0.0 --port 8080 --app-dir /workspace/ai-vm/app &
+        exec python3 -u ai-vm/workers/assets_worker.py
       '
     restart: unless-stopped
     healthcheck:
@@ -116,7 +113,6 @@ services:
       timeout: 3s
       retries: 10
     restart: unless-stopped
-    # Optional: expose on host for debugging
     # ports:
     #   - "6379:6379"
 
