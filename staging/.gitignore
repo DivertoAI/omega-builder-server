@@ -1,0 +1,11 @@
+.dart_tool/
+.packages
+build/
+.dart_tools/
+.melos_tool/
+.flutter-plugins
+.flutter-plugins-dependencies
+.flutter-*
+.idea/
+.vscode/
+.DS_Store

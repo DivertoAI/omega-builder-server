@@ -20,6 +20,10 @@ from backend.app.api.routes_debug import router as debug_router
 from backend.app.api.routes_stubs import router as stubs_router
 from backend.app.api.routes_envs import router as envs_router
 from backend.app.api.routes_tags import router as tags_router
+from backend.app.api.routes_assets import router as assets_router
+from backend.app.api.routes_preview import router as preview_router
+from backend.app.api.routes_appetize import router as appetize_router
+
 # END OMEGA STUB IMPORTS (managed)
 
 # Lightweight middleware (kept minimal to avoid test flakiness)
@@ -81,11 +85,14 @@ def create_app() -> FastAPI:
     app.include_router(plan_router)
     app.include_router(generate_router)
     app.include_router(debug_router)
+    app.include_router(assets_router)
 
     # BEGIN OMEGA STUB INCLUDES (managed)
     app.include_router(stubs_router)
     app.include_router(envs_router)
     app.include_router(tags_router)
+    app.include_router(preview_router)
+    app.include_router(appetize_router)
     # END OMEGA STUB INCLUDES (managed)
 
     # Friendly root

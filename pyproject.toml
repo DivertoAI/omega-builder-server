@@ -17,6 +17,7 @@ dependencies = [
   "sse-starlette>=2.1",
   "openai>=1.40.0",
   "redis>=5.0",  
+  "requests>=2.32",   
 ]
 
 [tool.uvicorn]
