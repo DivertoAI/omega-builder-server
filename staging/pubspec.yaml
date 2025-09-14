@@ -1,10 +1,11 @@
-name: omega_app
-description: OmegaSpec derived from brief: A Flutter app to browse items with search and a detail page.
-publish_to: "none"
-version: 0.1.0+1
+name: flutter_list_detail
+description: A Flutter app that displays a list on the home screen and a detail screen for each item.
+publish_to: 'none'
+version: 0.1.0
 
 environment:
   sdk: ">=3.3.0 <4.0.0"
+  flutter: ">=3.19.0"
 
 dependencies:
   flutter:

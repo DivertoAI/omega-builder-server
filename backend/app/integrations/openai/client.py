@@ -23,22 +23,13 @@ def _coerce_part_to_input_text(part: Any) -> Dict[str, Any]:
     """
     Normalize any content 'part' into Responses format:
       {"type": "input_text", "text": "<...>"}
-
-    Accepts:
-      - plain strings
-      - {"type": "text", "text": "..."}  (old style)  -> coerced
-      - {"type": "input_text", "text": "..."}         -> passed through
-      - {"text": "..."} with no 'type'                -> coerced
-      - anything else -> stringified
     """
     if isinstance(part, str):
         return {"type": "input_text", "text": part}
 
     if isinstance(part, dict):
         p = dict(part)
-        # prefer explicit text if present
         txt = p.get("text")
-        # normalize the type
         ptype = p.get("type")
         if ptype == "input_text" and isinstance(txt, str):
             return {"type": "input_text", "text": txt}
@@ -46,50 +37,35 @@ def _coerce_part_to_input_text(part: Any) -> Dict[str, Any]:
             return {"type": "input_text", "text": txt}
         if ptype is None and isinstance(txt, str):
             return {"type": "input_text", "text": txt}
-        # last-ditch: stringify whole dict
         return {"type": "input_text", "text": str(part)}
 
-    # unknown type -> stringify
     return {"type": "input_text", "text": str(part)}
 
 
 def _messages_to_responses_input(messages: Sequence[Dict[str, Any]]) -> Dict[str, Any]:
     """
     Convert chat-style messages:
-        [{"role": "system|user|assistant", "content": str|list|dict}, ...]
-    into a Responses API 'input' payload.
+        [{"role": "system|user|assistant|tool", "content": str|list|dict}, ...]
+    into a Responses API 'input' payload:
 
-    Responses expects:
-      {
-        "input": [
-          {
-            "role": "...",
-            "content": [{"type": "input_text", "text": "..."}]
-          },
-          ...
-        ]
-      }
+      {"input":[{"role":"...","content":[{"type":"input_text","text":"..."}]}]}
     """
     formatted: List[Dict[str, Any]] = []
     for m in messages:
         role = str(m.get("role", "")).strip() or "user"
         content = m.get("content", "")
 
-        # common cases fast-path
         if isinstance(content, str):
             formatted.append({"role": role, "content": [{"type": "input_text", "text": content}]})
             continue
 
-        # already list of parts? normalize each
         parts: List[Dict[str, Any]] = []
         if isinstance(content, list):
             for part in content:
                 parts.append(_coerce_part_to_input_text(part))
         elif isinstance(content, dict):
-            # single part dict
             parts.append(_coerce_part_to_input_text(content))
         else:
-            # anything else -> stringify
             parts.append({"type": "input_text", "text": str(content)})
 
         formatted.append({"role": role, "content": parts})
@@ -110,8 +86,6 @@ def _extract_responses_text(resp: Any) -> str:
         return resp.output_text.strip()
 
     chunks: List[str] = []
-
-    # Typical Responses object: resp.output is a list of items
     try:
         output = getattr(resp, "output", None) or []
         for item in output:
@@ -125,10 +99,8 @@ def _extract_responses_text(resp: Any) -> str:
             content = content or []
 
             for c in content:
-                # object-like access
                 text_attr = None
                 if not isinstance(c, dict):
-                    # attempt attribute forms
                     if hasattr(c, "text"):
                         t = getattr(c, "text")
                         if isinstance(t, str):
@@ -136,13 +108,11 @@ def _extract_responses_text(resp: Any) -> str:
                         else:
                             text_attr = getattr(t, "value", None)
                 else:
-                    # dict form
                     text_attr = c.get("text")
 
                 if isinstance(text_attr, str):
                     chunks.append(text_attr)
     except Exception:
-        # if structure is different, try a very defensive parse
         pass
 
     return "".join(chunks).strip()
@@ -199,11 +169,56 @@ class OpenAIClient:
             req["max_output_tokens"] = max_output_tokens
 
         # Optional, harmless hint for GPT-5 family
-        if model_name.lower().startswith("gpt-5"):
-            req["reasoning"] = {"effort": "medium"}
+        try:
+            if model_name and model_name.lower().startswith("gpt-5"):
+                req["reasoning"] = {"effort": "medium"}
+        except Exception:
+            pass
 
         resp = self._client.responses.create(**req)
         return _extract_responses_text(resp)
+
+    # ---------------------------------------------------------------------
+    # Back-compat: emulate Chat Completions via Responses (text-only).
+    # This is sufficient for simple "messages -> content" uses (e.g., planner/coder).
+    # It does NOT emulate function/tool-calls; those call sites should migrate to Responses.
+    # ---------------------------------------------------------------------
+    def chat_completions_create_compat(self, **kwargs):
+        """
+        Emulate openai.chat.completions.create(...) using the Responses API.
+
+        Supported kwargs:
+          - model
+          - messages
+          - max_tokens / max_output_tokens
+          - temperature (ignored)
+
+        Returns an object with .choices[0].message.content so existing code works.
+        """
+        model = kwargs.get("model") or settings.omega_llm_model
+        messages = kwargs.get("messages") or []
+        max_tokens = kwargs.get("max_tokens")
+        max_output_tokens = kwargs.get("max_output_tokens") or max_tokens
+
+        text = self.respond(
+            model=model,
+            messages=messages,
+            max_output_tokens=max_output_tokens,
+        ) or ""
+
+        class _Msg:
+            def __init__(self, content: str):
+                self.content = content
+
+        class _Choice:
+            def __init__(self, msg: _Msg):
+                self.message = msg
+
+        class _Resp:
+            def __init__(self, choices):
+                self.choices = choices
+
+        return _Resp([_Choice(_Msg(text))])
 
     @retry(
         retry=retry_if_exception_type(Exception),

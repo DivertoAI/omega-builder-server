@@ -1,3 +1,4 @@
+# backend/app/services/agent_service.py
 from __future__ import annotations
 
 import json
@@ -77,6 +78,7 @@ KICKOFF_INSTRUCTION = """Plan the app and THEN build it.
 
 def _assistant_message_to_dict(msg) -> Dict[str, Any]:
     """
+    (Kept for historical compatibility; not used by the Responses path.)
     Normalize an SDK ChatCompletionMessage to a plain dict suitable for the next call.
     """
     tool_calls = []
@@ -88,7 +90,6 @@ def _assistant_message_to_dict(msg) -> Dict[str, Any]:
                     "type": "function",
                     "function": {
                         "name": tc.function.name,
-                        # Chat Completions returns arguments as a JSON string:
                         "arguments": tc.function.arguments,
                     },
                 }
@@ -129,7 +130,6 @@ def _extract_diff_preview(tool_log: List[Dict[str, Any]], max_chars: int = 4000)
 def _tool_names(tools: Iterable[dict]) -> Set[str]:
     names: Set[str] = set()
     for t in tools or []:
-        # Expect {"type":"function","function":{"name": "...", ...}}
         fn = t.get("function", {})
         name = fn.get("name")
         if isinstance(name, str):
@@ -151,19 +151,26 @@ async def _warn_if_missing_tools(publish, tools: List[dict], required: Iterable[
             pass
 
 
-async def _chat_with_retries(client, kwargs: Dict[str, Any], max_attempts: int = 3, base_delay: float = 0.4):
+async def _responses_call_with_retries(client, *, model: str, messages: List[dict], max_output_tokens: Optional[int],
+                                       max_attempts: int = 3, base_delay: float = 0.4) -> str:
     """
-    Tiny retry helper for Chat Completions.
-    Retries on 429 and 5xx; jitter added. Synchronous OpenAI call inside.
+    Retry wrapper around our Responses client (client.respond).
+    Retries on generic exceptions with basic backoff.
+    Returns plain text from the model.
     """
     attempt = 0
     while True:
         attempt += 1
         try:
-            return client._client.chat.completions.create(**kwargs)
+            return client.respond(
+                model=model,
+                messages=messages,
+                max_output_tokens=max_output_tokens,
+            ) or ""
         except Exception as e:
+            # Best-effort status extraction
             status = getattr(e, "status_code", None)
-            retryable = (status == 429) or (isinstance(status, int) and 500 <= status < 600)
+            retryable = (status == 429) or (isinstance(status, int) and 500 <= status < 600) or (status is None)
             if not retryable or attempt >= max_attempts:
                 raise
             delay = base_delay * (2 ** (attempt - 1)) + random.uniform(0.05, 0.25)
@@ -186,7 +193,6 @@ def _persist_last_run(payload: Dict[str, Any]) -> None:
             trimmed["tool_log"] = tl[-200:]  # keep the last 200 entries
         LAST_RUN_PATH.write_text(json.dumps(trimmed, ensure_ascii=False, indent=2), encoding="utf-8")
     except Exception:
-        # non-fatal
         pass
 
 
@@ -252,7 +258,6 @@ async def _maybe_run_quality_gate(
             pass
         return None
 
-    # Try a few common signatures to be resilient against minor API drift.
     raw_result: Any = None
     try:
         try:
@@ -300,13 +305,13 @@ async def adapt_repository_with_agent(
     per_call_timeout_sec: Optional[float] = None,
 ) -> Dict[str, Any]:
     """
-    Orchestrates a Chat Completions function-calling loop to apply edits described by the spec.
+    Orchestrates a model-guided loop (Responses API) to apply edits described by the spec.
     Returns a summary, a log of tool_call results, a diff preview, the job_id, and (if available) quality gate results.
 
     Behavior:
       - validate_only: run read/plan/diff but DO NOT mutate the filesystem (fs_write/fs_patch/fs_mkdir/fs_delete are skipped).
       - wall_clock_budget_sec: hard wall-clock budget for the entire run (default 60s).
-      - per_call_timeout_sec: per ChatCompletion turn timeout (default 20s).
+      - per_call_timeout_sec: per model-call timeout (default 20s).
       - Forced finalization ensures fs_glob/fs_diff, quality gate attempt, and an agent_summary are emitted.
       - Persists last run to workspace/.omega/last_run.json for quick debugging.
     """
@@ -317,7 +322,7 @@ async def adapt_repository_with_agent(
     turn_timeout = float(per_call_timeout_sec or getattr(settings, "omega_agent_per_call_timeout_sec", DEFAULT_TURN_TIMEOUT))
 
     client = get_openai_client()
-    tools = openai_tool_specs()  # list of {"type": "function", "function": {...}}
+    tools = openai_tool_specs()  # kept for parity; current flow does not expose tool-calls to the model
     tool_log: List[Dict[str, Any]] = []
     job_id_seen: Optional[str] = None
 
@@ -363,7 +368,7 @@ async def adapt_repository_with_agent(
 
         # --- Agent loop (0.12 → 0.92)
         loop_steps = 13  # bounded for safety
-        base, per_step = _loop_progress_fn(loop_steps)
+        start, per_step = 0.12, (0.92 - 0.12) / loop_steps
 
         try:
             for step in range(1, loop_steps + 1):
@@ -373,20 +378,21 @@ async def adapt_repository_with_agent(
                     break
 
                 # Small pre-step nudge so UI moves before the model call
-                await pbar.set(min(base + (step - 1) * per_step + 0.01, 0.90), "agent_step_enter", {"step": step})
+                await pbar.set(min(start + (step - 1) * per_step + 0.01, 0.90), "agent_step_enter", {"step": step})
 
-                create_kwargs: Dict[str, Any] = {
-                    "model": settings.omega_llm_model,
-                    "messages": messages,
-                    "tools": tools,
-                    "tool_choice": "auto",
-                }
-
+                model_name = settings.omega_llm_model
                 per_turn_budget = max(1.0, min(turn_timeout, max(1.0, remaining - 1.0)))
 
                 try:
-                    resp = await asyncio.wait_for(
-                        _chat_with_retries(client, create_kwargs, max_attempts=3, base_delay=0.4),
+                    text = await asyncio.wait_for(
+                        _responses_call_with_retries(
+                            client,
+                            model=model_name,
+                            messages=messages,
+                            max_output_tokens=2048,
+                            max_attempts=3,
+                            base_delay=0.4,
+                        ),
                         timeout=per_turn_budget,
                     )
                 except asyncio.TimeoutError:
@@ -394,64 +400,16 @@ async def adapt_repository_with_agent(
                         {
                             "name": "model_call_timeout",
                             "args": {"per_call_timeout_sec": per_turn_budget, "step": step},
-                            "result": {"ok": False, "error": "chat.completions timeout"},
+                            "result": {"ok": False, "error": "responses timeout"},
                         }
                     )
                     await pbar.bump(0.005, "agent_turn_timeout", {"step": step, "timeout_sec": per_turn_budget})
                     break
 
-                assistant_msg = resp.choices[0].message
-                assistant_dict = _assistant_message_to_dict(assistant_msg)
+                assistant_dict = {"role": "assistant", "content": text, "tool_calls": None}
                 messages.append(assistant_dict)
 
-                # Execute tool calls (if any)
-                if assistant_dict.get("tool_calls"):
-                    # Progress slice for this step
-                    # We’ll distribute a few tiny bumps within the step while tools run
-                    in_step_bump = min(per_step * 0.6, 0.03)  # cap per tool-burst bump
-                    for tc in assistant_dict["tool_calls"]:
-                        name = tc["function"]["name"]
-                        raw_args = tc["function"].get("arguments") or "{}"
-                        try:
-                            args = json.loads(raw_args) if isinstance(raw_args, str) else (raw_args or {})
-                        except Exception:
-                            args = {}
-
-                        if validate_only and name in WRITEY:
-                            result = {
-                                "ok": True,
-                                "skipped": True,
-                                "reason": "validate_only",
-                                "tool": name,
-                                "args": args,
-                            }
-                        else:
-                            result = dispatch_tool_call(name, args)
-
-                        tool_log.append({"name": name, "args": args, "result": result})
-
-                        short_path = args.get("path") or args.get("root") or args.get("pattern") or ""
-                        await pbar.bump(in_step_bump, "agent_tool_result", {"tool": name, "path": short_path})
-
-                        if (not validate_only) and name in WRITEY:
-                            p = args.get("path") or args.get("pattern") or args.get("root")
-                            if isinstance(p, str) and p:
-                                touched_paths.append(p)
-
-                        messages.append(
-                            {
-                                "role": "tool",
-                                "tool_call_id": tc["id"],
-                                "content": json.dumps(result, ensure_ascii=False),
-                            }
-                        )
-
-                    # Nudge at end of tools for this step
-                    await pbar.set(min(base + step * per_step, 0.92), "agent_step_done", {"step": step})
-                    # Let model react to tools next turn
-                    continue
-
-                # No tool calls; check for DONE sentinel
+                # No tool calls via Responses in this minimal loop; check for DONE sentinel
                 text_out: str = assistant_dict.get("content") or ""
                 if isinstance(text_out, str) and text_out.strip().upper().startswith("DONE:"):
                     await pbar.set(0.92, "agent_declared_done", {"step": step})

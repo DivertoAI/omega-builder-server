@@ -86,35 +86,37 @@ def _extract_first_json_object(text: str) -> Dict[str, Any]:
 
 
 # =========================
-# LLM calls
+# LLM calls (via Responses API)
 # =========================
 
 def _llm_plan(brief: str) -> Dict[str, Any]:
     """
-    Ask the PLANNER model (O3 family) to propose an OmegaSpec (as JSON). Raise on failure.
-    (Currently using Chat Completions for compatibility; switch to Responses if needed.)
+    Ask the PLANNER model (o3 family or similar) to propose an OmegaSpec (as JSON).
+    Uses OpenAI Responses through our client wrapper to avoid /v1/chat.completions 400s.
     """
     client = get_openai_client()
+    planner_model = getattr(settings, "omega_planner_model", settings.omega_llm_model)
 
-    planner_model = getattr(settings, "omega_planner_model", "gpt-4.1")
-    temperature = float(getattr(settings, "planner_temperature", 0.2) or 0.2)
-
-    resp = client._client.chat.completions.create(
-        model=planner_model,  # O3 may require Responses; if so we can upgrade later.
+    text = client.respond(
+        model=planner_model,
         messages=[
             {"role": "system", "content": _PLANNER_SYSTEM},
             {"role": "user", "content": _PLANNER_USER_TEMPLATE.format(brief=brief.strip())},
         ],
-        temperature=temperature,
-    )
-    text = resp.choices[0].message.content or ""
-    return _extract_first_json_object(text)
+        max_output_tokens=2048,
+    ) or ""
+
+    # Parse as JSON (with tolerant fallback)
+    try:
+        return json.loads(text)
+    except Exception:
+        return _extract_first_json_object(text)
 
 
 def _llm_coder_refine(spec: Dict[str, Any]) -> Dict[str, Any]:
     """
     Ask the CODER model (GPT-5 by default) to refine the spec, still JSON-only.
-    This stays adaptive by avoiding boilerplate/templates and only improving the JSON.
+    Routes through Responses as well.
     """
     client = get_openai_client()
     spec_json = json.dumps(spec, ensure_ascii=False)
@@ -124,29 +126,31 @@ def _llm_coder_refine(spec: Dict[str, Any]) -> Dict[str, Any]:
         or getattr(settings, "omega_coder_model", None)
         or getattr(settings, "omega_llm_model", "gpt-5")
     )
-    temperature = float(getattr(settings, "coder_temperature", 0.2) or 0.2)
 
-    resp = client._client.chat.completions.create(
+    text = client.respond(
         model=code_model,
         messages=[
             {"role": "system", "content": _CODER_SYSTEM},
             {"role": "user", "content": _CODER_USER_TEMPLATE.format(spec_json=spec_json)},
         ],
-        temperature=temperature,
-    )
-    text = resp.choices[0].message.content or ""
-    return _extract_first_json_object(text)
+        max_output_tokens=2048,
+    ) or ""
+
+    try:
+        return json.loads(text)
+    except Exception:
+        return _extract_first_json_object(text)
 
 
 # =========================
 # Normalizers / repairs
 # =========================
 
-def _force_list_radius(value: Any) -> list:
+def _force_list_radius(value: Any) -> list[int]:
     if value is None:
         return [8]
     if isinstance(value, list):
-        out = []
+        out: list[int] = []
         for v in value:
             if isinstance(v, (int, float)):
                 out.append(int(max(0, min(64, int(v)))))
@@ -180,8 +184,8 @@ def _repair_navigation(nav: Any) -> Dict[str, Any]:
         items = []
     normalized = []
     for it in items:
-        if isinstance(it, str):
-            normalized.append(it)
+        if isinstance(it, str) and it.strip():
+            normalized.append(it.strip())
         elif isinstance(it, dict):
             rid = _ensure_str(it.get("id"), "")
             if rid:
@@ -190,20 +194,49 @@ def _repair_navigation(nav: Any) -> Dict[str, Any]:
     return {"home": home, "items": normalized}
 
 
-def _repair_acceptance(acc: Any) -> list:
-    acc_list = _ensure_list(acc)
-    has_health = any(
-        isinstance(a, dict) and _ensure_str(a.get("description"), "").lower().find("health") != -1
-        for a in acc_list
-    )
+def _normalize_kv_items(items: Any) -> list[dict]:
+    """
+    For entities/apis: accept strings or dicts; return [{id, title?}] with valid 'id'.
+    Drop invalid entries.
+    """
+    out: list[dict] = []
+    for it in (items if isinstance(items, list) else []):
+        if isinstance(it, str) and it.strip():
+            rid = it.strip()
+            out.append({"id": rid, "title": rid.title()})
+        elif isinstance(it, dict):
+            rid = _ensure_str(it.get("id"), "")
+            if rid:
+                title = _ensure_str(it.get("title"), rid.title())
+                d = dict(it)
+                d["id"] = rid
+                d.setdefault("title", title)
+                out.append(d)
+    return out
+
+
+def _repair_acceptance(acc: Any) -> list[dict]:
+    """
+    Ensure at least one health check with id+description exists.
+    Normalize existing items to have id/description when possible; drop the rest.
+    """
+    out: list[dict] = []
+    for it in (acc if isinstance(acc, list) else []):
+        if isinstance(it, dict):
+            did = _ensure_str(it.get("id"), "")
+            desc = _ensure_str(it.get("description"), "")
+            if did and desc:
+                out.append({"id": did, "description": desc})
+    # Ensure health check present
+    has_health = any("health" in (a.get("description", "").lower()) for a in out)
     if not has_health:
-        acc_list.append(
+        out.append(
             {
                 "id": "service-boots-and-health-endpoint-returns-ok",
                 "description": "Service boots and health endpoint returns ok.",
             }
         )
-    return acc_list
+    return out
 
 
 def auto_repair_spec(spec: Dict[str, Any]) -> Dict[str, Any]:
@@ -233,11 +266,11 @@ def auto_repair_spec(spec: Dict[str, Any]) -> Dict[str, Any]:
     # navigation
     spec["navigation"] = _repair_navigation(spec.get("navigation"))
 
-    # entities / apis
-    spec["entities"] = _ensure_list(spec.get("entities"))
-    spec["apis"] = _ensure_list(spec.get("apis"))
+    # entities / apis (force to list of dicts with id)
+    spec["entities"] = _normalize_kv_items(spec.get("entities"))
+    spec["apis"] = _normalize_kv_items(spec.get("apis"))
 
-    # acceptance
+    # acceptance (ensure at least one valid health check)
     spec["acceptance"] = _repair_acceptance(spec.get("acceptance"))
 
     return spec
@@ -249,7 +282,7 @@ def auto_repair_spec(spec: Dict[str, Any]) -> Dict[str, Any]:
 
 def plan_and_validate(brief: str, max_repairs: int = 1) -> Tuple[Any, Dict[str, Any]]:
     """
-    Plan from a brief using the LLMs (O3 planner -> GPT-5 coder refine).
+    Plan from a brief using the LLMs (Planner -> Coder refine).
     Validate into an OmegaSpec. If validation fails, apply auto-repair up to max_repairs times.
 
     Returns:
@@ -257,7 +290,7 @@ def plan_and_validate(brief: str, max_repairs: int = 1) -> Tuple[Any, Dict[str, 
     Raises:
         Exception on repeated validation failure.
     """
-    # 1) Ask the PLANNER (O3) for a spec proposal
+    # 1) Ask the PLANNER for a spec proposal (JSON only)
     try:
         raw = _llm_plan(brief)
     except Exception:
@@ -277,7 +310,7 @@ def plan_and_validate(brief: str, max_repairs: int = 1) -> Tuple[Any, Dict[str, 
             ],
         }
 
-    # 2) Optional: let the CODER (GPT-5) refine the JSON (still no templates)
+    # 2) Optional: let the CODER refine the JSON (still no templates)
     try:
         refined = _llm_coder_refine(raw)
     except Exception:

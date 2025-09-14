@@ -1,5 +1,3 @@
-version: "3.9"
-
 services:
   omega:
     build:
@@ -32,12 +30,15 @@ services:
       # Ensure omega writes artifacts where ai-vm can see them
       OMEGA_STAGING_ROOT: "/workspace/staging"
 
+      # Use the SAME queue name as the AI-VM worker
+      AI_VM_QUEUE_KEY: "queue:build"
+
       # Optional safety/time caps (tweak as needed)
       OMEGA_MAX_AGENT_ROUNDS: "8"
       OMEGA_DEFAULT_WALL_CLOCK_SEC: "900"
     volumes:
       - .:/app:delegated
-      - .:/workspace:delegated          # 👈 shared path visible to both omega and ai-vm
+      - .:/workspace:delegated          # shared path visible to both omega and ai-vm
       - omega_workspace:/app/workspace/.omega
     command: >
       python -m uvicorn backend.main:app
@@ -47,9 +48,7 @@ services:
     stdin_open: true
     restart: unless-stopped
     healthcheck:
-      # Keep this very infrequent to avoid log noise
-      disable: true
-      test: ["CMD", "curl", "-fsS", "http://localhost:8000/api/health"]
+      test: ["CMD", "curl", "-fsS", "http://localhost:8000/health"]
       interval: 2m
       timeout: 5s
       retries: 1
@@ -75,11 +74,15 @@ services:
       # reduce tool noise in CI-like runs
       CI: "true"
       REDIS_URL: "redis://redis:6379/0"
+
+      # Use the SAME queue name as omega enqueues to
+      AI_VM_QUEUE_KEY: "queue:build"
     volumes:
       # Mount the repo at /workspace so the VM can act on the generated app
       - .:/workspace:delegated
-      # Cache pub packages between runs (optional, improves speed)
+      # Cache pub packages & Gradle between runs (improves speed)
       - ai_vm_pub_cache:/home/flutter/.pub-cache
+      - ai_vm_gradle_cache:/home/flutter/.gradle
     restart: unless-stopped
     healthcheck:
       # Slow and simple health check; not related to OpenAI billing
@@ -88,6 +91,9 @@ services:
       timeout: 8s
       retries: 1
       start_period: 30s
+    depends_on:
+      redis:
+        condition: service_healthy
 
   redis:
     image: redis:7-alpine
@@ -106,3 +112,4 @@ services:
 volumes:
   omega_workspace:
   ai_vm_pub_cache:
+  ai_vm_gradle_cache:
