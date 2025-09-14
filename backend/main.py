@@ -15,15 +15,14 @@ from backend.app.api.sse import router as sse_router
 from backend.app.api.routes_plan import router as plan_router
 from backend.app.api.routes_generate import router as generate_router
 from backend.app.api.routes_debug import router as debug_router
+from backend.app.api.routes_assets import router as assets_router  # <-- assets
 
 # BEGIN OMEGA STUB IMPORTS (managed)
 from backend.app.api.routes_stubs import router as stubs_router
 from backend.app.api.routes_envs import router as envs_router
 from backend.app.api.routes_tags import router as tags_router
-from backend.app.api.routes_assets import router as assets_router
 from backend.app.api.routes_preview import router as preview_router
 from backend.app.api.routes_appetize import router as appetize_router
-
 # END OMEGA STUB IMPORTS (managed)
 
 # Lightweight middleware (kept minimal to avoid test flakiness)
@@ -85,7 +84,7 @@ def create_app() -> FastAPI:
     app.include_router(plan_router)
     app.include_router(generate_router)
     app.include_router(debug_router)
-    app.include_router(assets_router)
+    app.include_router(assets_router)  # <-- exposes /api/assets/generate
 
     # BEGIN OMEGA STUB INCLUDES (managed)
     app.include_router(stubs_router)
@@ -109,6 +108,7 @@ def create_app() -> FastAPI:
                 "health": "/api/health",
                 "plan": "POST /api/plan",
                 "generate": "POST /api/generate",
+                "assets_generate": "POST /api/assets/generate",  # <-- new tip
                 "debug_last_run": "/api/debug/last-run",
             },
         }
