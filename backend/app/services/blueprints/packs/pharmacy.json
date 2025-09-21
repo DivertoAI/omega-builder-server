@@ -1,0 +1,17 @@
+{
+  "project": "insta_pharma",
+  "apps": [
+    {"name": "customer", "kind": "flutter_app", "path": "apps/customer", "options": {"features": ["catalog", "cart", "orders", "rx_upload", "consultation"]}},
+    {"name": "doctor_dashboard", "kind": "flutter_dashboard", "path": "dashboards/doctor", "options": {"features": ["queue", "e_rx", "chat"]}},
+    {"name": "retailer_dashboard", "kind": "flutter_dashboard", "path": "dashboards/retailer", "options": {"features": ["inventory", "rx_validate", "dispatch"]}},
+    {"name": "admin_dashboard", "kind": "flutter_dashboard", "path": "dashboards/admin", "options": {"features": ["partners", "analytics", "audit_logs"]}},
+    {"name": "api", "kind": "fastapi_service", "path": "services/api", "options": {"routes": ["/health", "/orders", "/rx", "/consult"]}},
+    {"name": "design", "kind": "design_system", "path": "design", "options": {"brand": "InstaPharma"}},
+    {"name": "infra", "kind": "infra", "path": "infra"}
+  ],
+  "design": {
+    "fonts": ["Inter", "Merriweather"],
+    "palette": {"primary": "#16A34A", "secondary": "#0EA5E9"},
+    "radius": [8, 12, 16]
+  }
+}

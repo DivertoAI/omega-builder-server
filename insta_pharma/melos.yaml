@@ -1,0 +1,11 @@
+name: insta_pharma
+packages:
+  - "apps/*"
+  - "services/*"
+
+command:
+  bootstrap:
+    usePubspecOverrides: true
+
+ide:
+  intellij: true

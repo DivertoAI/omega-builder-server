@@ -1,14 +1,21 @@
-name: hello_button_app
-description: A minimal single-screen Flutter app that displays 'Hello' text and a button.
+name: hello_omega
+description: Simple Flutter app showing 'Hello from Omega' on the Home screen with Android/iOS scaffolding and a health-check endpoint.
 publish_to: "none"
-version: 1.0.0+1
+version: 0.1.0
 
 environment:
-  sdk: ">=3.0.0 <4.0.0"
+  sdk: ">=3.3.0 <4.0.0"
 
 dependencies:
   flutter:
     sdk: flutter
+  cupertino_icons: ^1.0.6
+  shelf: ^1.4.1
+
+dev_dependencies:
+  flutter_test:
+    sdk: flutter
+  flutter_lints: ^3.0.2
 
 flutter:
   uses-material-design: true

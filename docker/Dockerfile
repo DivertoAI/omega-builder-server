@@ -3,9 +3,9 @@ FROM python:3.11-slim
 
 WORKDIR /app
 
-# Minimal system deps (curl for healthcheck/log checks)
+# Minimal system deps (curl for healthcheck/log checks, rsync for preview publishing)
 RUN apt-get update \
-    && apt-get install -y --no-install-recommends curl \
+    && apt-get install -y --no-install-recommends curl rsync \
     && rm -rf /var/lib/apt/lists/*
 
 # Environment for noiseless logs & imports

@@ -1,0 +1,27 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>InstaPharma</title>
+  <link rel="stylesheet" href="./styles.css">
+</head>
+<body>
+  <header class="topbar">
+    <div class="brand">InstaPharma</div>
+    <nav class="nav" aria-label="Primary">
+      <a href="#/dashboard" data-route="dashboard" class="nav-link">Dashboard</a>
+      <a href="#/orders" data-route="orders" class="nav-link">Orders</a>
+      <a href="#/prescriptions" data-route="prescriptions" class="nav-link">Prescriptions</a>
+      <a href="#/pharmacies" data-route="pharmacies" class="nav-link">Pharmacies</a>
+      <a href="#/profile" data-route="profile" class="nav-link">Profile</a>
+    </nav>
+  </header>
+
+  <main id="app" class="container" tabindex="-1"></main>
+
+  <footer class="footer">© <span id="year"></span> InstaPharma</footer>
+
+  <script src="./app.js" defer></script>
+</body>
+</html>

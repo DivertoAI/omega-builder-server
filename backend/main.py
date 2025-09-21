@@ -5,6 +5,7 @@ import os
 import traceback
 from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse
+from fastapi.staticfiles import StaticFiles
 
 from backend.app.core.logging import setup_logging
 from backend.app.core.config import settings  # <- unified settings
@@ -24,6 +25,21 @@ from backend.app.api.routes_tags import router as tags_router
 from backend.app.api.routes_preview import router as preview_router
 from backend.app.api.routes_appetize import router as appetize_router
 # END OMEGA STUB IMPORTS (managed)
+
+# NEW: Build+Publish orchestration (ai-vm build → omega publish)
+from backend.app.api.routes_build_preview import router as build_preview_router
+from backend.app.api.routes_build_matrix import router as build_matrix_router
+from backend.app.api.routes_scaffold import router as scaffold_router
+from backend.app.api.routes_preview_index import router as preview_index_router
+from backend.app.api.routes_wire_services import router as wire_services_router
+from backend.app.api.routes_metrics import router as metrics_router
+from backend.app.api.routes_orchestrate import router as orchestrate_router
+from backend.routes.api_products import router as products_router
+from backend.routes.api_cart import router as cart_router
+from backend.routes.api_checkout import router as checkout_router
+from backend.routes.api_orders import router as orders_router
+from backend.routes.api_rx import router as rx_router
+from backend.routes.api_validate import router as validate_router
 
 # Lightweight middleware (kept minimal to avoid test flakiness)
 try:
@@ -94,6 +110,38 @@ def create_app() -> FastAPI:
     app.include_router(appetize_router)
     # END OMEGA STUB INCLUDES (managed)
 
+    # NEW: Build+Publish (one-call) — /api/preview/build and friends
+    app.include_router(build_preview_router)
+    app.include_router(build_matrix_router)
+    app.include_router(scaffold_router)
+    app.include_router(preview_index_router)
+    app.include_router(wire_services_router)
+    app.include_router(metrics_router)
+    app.include_router(orchestrate_router) 
+
+
+
+    app.include_router(products_router)
+    app.include_router(cart_router)
+    app.include_router(checkout_router)
+    app.include_router(orders_router)
+    app.include_router(rx_router)
+    app.include_router(validate_router)
+
+    # Static mount for web previews (served at /preview/<project>/<app>)
+    # IMPORTANT: html=True enables directory index fallback to index.html
+    OMEGA_PREVIEW_ROOT = os.environ.get("OMEGA_PREVIEW_ROOT", "/preview")
+    try:
+        app.mount(
+            "/preview",
+            StaticFiles(directory=OMEGA_PREVIEW_ROOT, html=True),
+            name="preview",
+        )
+    except Exception:
+        # If the directory is missing at startup, we'll still try to serve later; avoid startup crash
+        # (Directory will be created on first publish.)
+        pass
+
     # Friendly root
     @app.get("/")
     def root():
@@ -108,7 +156,9 @@ def create_app() -> FastAPI:
                 "health": "/api/health",
                 "plan": "POST /api/plan",
                 "generate": "POST /api/generate",
-                "assets_generate": "POST /api/assets/generate",  # <-- new tip
+                "assets_generate": "POST /api/assets/generate",
+                "preview_index": "/preview",
+                "preview_build": "POST /api/preview/build",
                 "debug_last_run": "/api/debug/last-run",
             },
         }

@@ -1,12 +1,18 @@
 from __future__ import annotations
 
 import json
-from typing import Any, Dict, Optional
+from typing import Any, Dict, List, Optional
 
-from fastapi import APIRouter, Body, HTTPException
+from fastapi import APIRouter, Body, HTTPException, Depends
 
+# ---- Existing OmegaSpec validation/planning ----
 from backend.app.models.spec import validate_spec
 from backend.app.services.plan_service import plan_and_validate
+
+# ---- Phase 2: packs/adapters/theme monorepo planning ----
+from backend.app.models.plan import PlanRequest, PlanResponse, AppSpec
+from backend.app.services.blueprints.merge import load_pack, apply_theme
+from backend.app.services.adapters.registry import activate
 
 router = APIRouter(prefix="/api", tags=["plan"])
 
@@ -55,10 +61,12 @@ def _auto_repair_spec(obj: Dict[str, Any]) -> Dict[str, Any]:
 
 @router.get("/health")
 async def health() -> Dict[str, Any]:
-    # assuming you already have this elsewhere; included here only if needed for completeness
     return {"status": "ok"}
 
 
+# --------------------------------------------------------------------------------------
+# V1: OmegaSpec planner/validator (unchanged behavior)
+# --------------------------------------------------------------------------------------
 @router.post("/plan")
 async def plan_endpoint(payload: Dict[str, Any] = Body(...)) -> Dict[str, Any]:
     """
@@ -123,3 +131,54 @@ async def plan_endpoint(payload: Dict[str, Any] = Body(...)) -> Dict[str, Any]:
 
     spec, raw = plan_and_validate(brief, max_repairs=max_repairs)
     return {"status": "ok", "spec": spec.model_dump(), "raw": raw}
+
+
+# --------------------------------------------------------------------------------------
+# V2: Monorepo planner (blueprint + adapters + theme) — Phase 2
+# --------------------------------------------------------------------------------------
+@router.post("/plan/monorepo", response_model=PlanResponse)
+async def plan_monorepo(req: PlanRequest = Body(...)) -> PlanResponse:
+    """
+    Phase 2 planner that merges a blueprint pack, applies theme tokens,
+    and activates env-gated adapters. Returns a high-level PlanResponse
+    describing the multi-app monorepo to be generated.
+
+    Body:
+      {
+        "brief": "optional human brief (not used yet)",
+        "blueprint": "pharmacy|blank|diary|None",
+        "adapters": ["ocr","telemed","payments","logistics","firebase","bluetooth"],
+        "theme": { "palette": {...}, "typography": {...}, "radius": [..] },
+        "max_repairs": 1
+      }
+    """
+    # 1) Load pack defaults
+    plan_dict: Dict[str, Any] = load_pack(req.blueprint)
+
+    # 2) Apply theme if provided
+    if req.theme:
+        plan_dict = apply_theme(plan_dict, req.theme.model_dump())
+
+    # 3) Activate adapters (env-gated)
+    active_adapters: List[str] = activate(req.adapters)
+
+    # 4) Minor auto-repair (radius list)
+    design = plan_dict.get("design", {})
+    radius = design.get("radius")
+    if not isinstance(radius, list):
+        design["radius"] = [6, 10, 14]
+        plan_dict["design"] = design
+
+    # 5) Build response
+    apps = [AppSpec(**a) for a in plan_dict.get("apps", [])]
+    return PlanResponse(
+        project=plan_dict.get("project", "omega_project"),
+        apps=apps,
+        design=plan_dict.get("design", {}),
+        adapters=active_adapters,
+        notes=[
+            "blueprint merged",
+            f"adapters activated: {active_adapters}",
+            "theme applied" if req.theme else "default theme",
+        ],
+    )

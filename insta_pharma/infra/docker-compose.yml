@@ -1,0 +1,10 @@
+# infra/docker-compose.yml
+version: "3.9"
+services:
+  preview:
+    image: nginx:stable-alpine
+    ports: ["8088:80"]
+    volumes:
+      - ../apps:/usr/share/nginx/html/apps:ro
+      - ../preview:/usr/share/nginx/html/preview:ro
+    restart: unless-stopped

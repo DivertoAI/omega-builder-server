@@ -1,56 +1,37 @@
 import 'package:flutter/material.dart';
 
-void main() {
-  runApp(const HelloButtonApp());
-}
+void main() => runApp(const HelloOmegaApp());
 
-class HelloButtonApp extends StatelessWidget {
-  const HelloButtonApp({super.key});
+class HelloOmegaApp extends StatelessWidget {
+  const HelloOmegaApp({super.key});
 
   @override
   Widget build(BuildContext context) {
-    final radius10 = BorderRadius.circular(10);
     return MaterialApp(
-      title: 'Hello Button App',
-      debugShowCheckedModeBanner: false,
+      title: 'hello_omega',
       theme: ThemeData(
-        colorSchemeSeed: Colors.blue,
-        elevatedButtonTheme: ElevatedButtonThemeData(
-          style: ElevatedButton.styleFrom(
-            shape: RoundedRectangleBorder(borderRadius: radius10),
-          ),
-        ),
+        colorSchemeSeed: Colors.indigo,
+        useMaterial3: true,
       ),
       initialRoute: '/home',
       routes: {
-        '/home': (context) => const HomePage(),
+        '/home': (context) => const HomeScreen(),
       },
     );
   }
 }
 
-class HomePage extends StatelessWidget {
-  const HomePage({super.key});
+class HomeScreen extends StatelessWidget {
+  const HomeScreen({super.key});
 
   @override
   Widget build(BuildContext context) {
     return Scaffold(
       appBar: AppBar(title: const Text('Home')),
-      body: Center(
-        child: Column(
-          mainAxisSize: MainAxisSize.min,
-          children: [
-            Text('Hello', style: Theme.of(context).textTheme.headlineMedium),
-            const SizedBox(height: 16),
-            ElevatedButton(
-              onPressed: () {
-                ScaffoldMessenger.of(context).showSnackBar(
-                  const SnackBar(content: Text('Button pressed')),
-                );
-              },
-              child: const Text('Press me'),
-            ),
-          ],
+      body: const Center(
+        child: Text(
+          'Hello from Omega',
+          textAlign: TextAlign.center,
         ),
       ),
     );

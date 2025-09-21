@@ -1,0 +1,22 @@
+name: Omega Preview
+
+on:
+  push:
+    branches: [main]
+
+jobs:
+  build-preview:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v3
+      - name: Build & Publish Matrix
+        run: |
+          curl -X POST http://localhost:8000/api/preview/build-matrix \
+            -H 'content-type: application/json' \
+            -d '{
+              "project": "insta_pharma",
+              "matrix": [
+                {"app_path": "/workspace/insta_pharma/apps/customer", "app_name": "customer"},
+                {"app_path": "/workspace/insta_pharma/apps/pharmacist", "app_name": "pharmacist"}
+              ]
+            }'

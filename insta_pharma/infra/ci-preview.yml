@@ -1,0 +1,28 @@
+# infra/ci-preview.yml
+name: Build Web Preview
+on:
+  workflow_dispatch:
+  push:
+    branches: [ main ]
+jobs:
+  build-web:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: subosito/flutter-action@v2
+        with:
+          channel: stable
+      - name: Build each app for web
+        run: |
+          set -eux
+          for app in $(ls -1 apps); do
+            cd apps/$app
+            flutter pub get
+            flutter build web --release
+            cd - >/dev/null
+          done
+      - name: Upload preview artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: web-preview
+          path: apps/*/build/web

@@ -1,0 +1,202 @@
+# packs/omega_monorepo/pack.yaml
+version: 1
+kind: pack
+name: omega_monorepo
+display_name: Omega Monorepo (Flutter + FastAPI)
+description: >
+  Generate an industry-grade monorepo with multiple Flutter apps (customer + dashboards),
+  a FastAPI backend, shared design system, asset pipeline, infra (compose), and preview flow.
+
+# === Inputs accepted by /api/plan and /api/generate ===
+inputs:
+  project_name:
+    type: string
+    required: true
+    description: Monorepo folder name and default app prefix.
+  brief:
+    type: string
+    required: true
+    description: High-level product brief for planning/spec generation.
+  blueprint:
+    type: string
+    required: false
+    default: "instapharma"
+    enum: ["instapharma"] # extend later
+    description: Which preconfigured blueprint defaults to merge.
+  adapters:
+    type: array
+    items: { type: string }
+    required: false
+    default: []
+    enum:
+      - ocr.basic
+      - telemed.mock
+      - payments.razorpay
+      - payments.stripe
+      - logistics.mock
+      - notifications.fcm
+      - auth.firebase
+      - storage.firebase
+      - bluetooth.mock
+  theme:
+    type: object
+    required: false
+    description: Optional override for design tokens (colors, type, spacing, radius, motion).
+
+# === Where pack assets live ===
+paths:
+  blueprint_defaults_dir: "packs/blueprints" # e.g., packs/blueprints/instapharma/spec.defaults.json
+  scaffold_root: "packs/omega_monorepo/scaffold" # copied & rendered into the monorepo
+  templates_root: "packs/omega_monorepo/templates" # handlebars/jinja tokens rendered into files
+  adapter_root: "packs/omega_monorepo/adapters" # per-adapter file patches & codegen hooks
+
+# === Merge strategy for /api/plan ===
+#   1) Start from blueprint defaults
+#   2) Merge planner spec
+#   3) Apply user overrides (theme, adapters)
+planning:
+  merge_order:
+    - source: "blueprint_defaults" # packs/blueprints/<blueprint>/spec.defaults.json
+    - source: "planner_spec" # LLM-planned spec from brief
+    - source: "user_overrides" # adapters + theme from request
+  # Soft validators for “industry-level” plans
+  validators:
+    - id: require_apps
+      description: Must define at least 2 apps in apps[].
+      when: "$.apps"
+      rule: "len($.apps) >= 2"
+    - id: require_backend
+      description: Must define FastAPI service in services.api.
+      when: "$.services.api"
+      rule: "exists($.services.api)"
+    - id: require_preview_targets
+      description: At least one flutter_web target to preview.
+      when: "$.apps"
+      rule: "any($.apps[*].targets[], @ == 'web')"
+
+# === Generation rules ===
+generator:
+  # Files/folders to copy verbatim (with token rendering where supported)
+  scaffold:
+    - from: "{{pack.scaffold_root}}/root/"
+      to: "./"
+      render: true
+
+  # Token context available during rendering
+  tokens:
+    project:
+      name: "{{inputs.project_name}}"
+      slug: "{{inputs.project_name | lower | replace(' ', '_')}}"
+    theme: "{{inputs.theme | default(blueprint.theme)}}"
+    adapters: "{{inputs.adapters}}"
+    blueprint: "{{inputs.blueprint}}"
+    date_utc: "{{now_utc}}"
+
+  # Adapter-specific patches
+  adapter_patches:
+    # Each adapter folder can contain:
+    # - files/ (copied into repo)
+    # - merge/pubspec.yaml (deep-merged into pubspecs)
+    # - merge/requirements.txt (merged into FastAPI service)
+    # - hooks.yaml (post-gen command hooks)
+    - id: ocr.basic
+      from: "{{pack.adapter_root}}/ocr.basic"
+    - id: telemed.mock
+      from: "{{pack.adapter_root}}/telemed.mock"
+    - id: payments.razorpay
+      from: "{{pack.adapter_root}}/payments.razorpay"
+    - id: payments.stripe
+      from: "{{pack.adapter_root}}/payments.stripe"
+    - id: logistics.mock
+      from: "{{pack.adapter_root}}/logistics.mock"
+    - id: notifications.fcm
+      from: "{{pack.adapter_root}}/notifications.fcm"
+    - id: auth.firebase
+      from: "{{pack.adapter_root}}/auth.firebase"
+    - id: storage.firebase
+      from: "{{pack.adapter_root}}/storage.firebase"
+    - id: bluetooth.mock
+      from: "{{pack.adapter_root}}/bluetooth.mock"
+
+  # Env stubs written to repo root
+  env_stubs:
+    - path: ".env.example"
+      render: true
+      template: |
+        # ==== Global ====
+        OMEGA_PROJECT={{project.slug}}
+
+        # ==== OpenAI (assets pipeline) ====
+        OPENAI_API_KEY=your_key_here
+
+        # ==== Backend (FastAPI) ====
+        API_BASE_URL=http://localhost:9000
+        SECRET_KEY=change_me
+        CORS_ORIGINS=["http://localhost:5173","http://localhost:8000"]
+
+        # ==== Adapters (optional) ====
+        # OCR
+        OCR_PROVIDER=basic
+        # Telemed
+        TELEMED_URL=https://telemed.mock.local
+        # Payments
+        RAZORPAY_KEY_ID=
+        RAZORPAY_KEY_SECRET=
+        STRIPE_SECRET_KEY=
+        # Logistics
+        LOGISTICS_BASE_URL=https://logistics.mock.local
+        # Firebase / Notifications
+        FIREBASE_PROJECT_ID=
+        FIREBASE_APP_ID_ANDROID=
+        FIREBASE_APP_ID_IOS=
+        FIREBASE_WEB_API_KEY=
+        FCM_SERVER_KEY=
+        # Bluetooth (mock)
+        BLUETOOTH_MOCK_DEVICE_ID=AA:BB:CC:11:22:33
+
+  # Post-gen commands run *inside* containers (ai-vm for Flutter; omega-builder for preview)
+  post_hooks:
+    - id: format_dart
+      run_in: ai-vm
+      cmd: "bash -lc 'dart format apps && dart format dashboards && dart format shared'"
+    - id: get_pub
+      run_in: ai-vm
+      cmd: "bash -lc 'cd apps/customer && flutter pub get && cd - >/dev/null; cd dashboards/admin && flutter pub get && cd - >/dev/null; cd dashboards/doctor && flutter pub get && cd - >/dev/null; cd dashboards/retailer && flutter pub get && cd - >/dev/null'"
+    - id: web_builds
+      run_in: ai-vm
+      when: "any($.apps[*].targets[], @ == 'web')"
+      cmd: "bash -lc 'cd apps/customer && flutter build web --release -t lib/main.dart -o build/web && cd - >/dev/null'"
+    - id: preview_push
+      run_in: omega-builder
+      cmd: "bash -lc 'mkdir -p /app/preview/{{project.slug}}/customer && cp -r apps/customer/build/web/* /app/preview/{{project.slug}}/customer/'"
+
+# === Quality Gate ===
+quality_gate:
+  checks:
+    - id: pubspec_present
+      description: Verify pubspec.yaml exists for every Flutter app.
+      path_glob: "apps/**/pubspec.yaml"
+      require_match: true
+    - id: main_dart_present
+      path_glob: "apps/**/lib/main.dart"
+      require_match: true
+    - id: backend_health
+      description: FastAPI health endpoint exists
+      path_glob: "services/api/app/api.py"
+      require_match: true
+    - id: theme_tokens
+      description: omega_theme.dart exists and exports colors/typography/spacing
+      path_glob: "shared/design/lib/omega_theme.dart"
+      require_match: true
+    - id: preview_artifacts
+      description: Customer web build copied to preview folder
+      path_glob: "preview/{{project.slug}}/customer/index.html"
+      require_match: false # becomes true after post_hooks
+
+# === Developer UX metadata (optional) ===
+docs:
+  getting_started: |
+    1) POST /api/plan with {brief, project_name, blueprint?, adapters?, theme?}
+    2) POST /api/generate with the same fields.
+    3) The pack scaffolds a monorepo under staging/, builds web, and pushes to /preview/<project>/customer.
+    4) Visit http://localhost:8000/preview?project=<project>&app=customer

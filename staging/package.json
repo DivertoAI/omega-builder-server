@@ -1,0 +1,12 @@
+{
+  "name": "instapharma",
+  "version": "0.1.0",
+  "description": "A platform for e-prescriptions, medication orders, and pharmacy fulfillment.",
+  "private": true,
+  "scripts": {
+    "start": "node server.js"
+  },
+  "dependencies": {
+    "express": "^4.21.1"
+  }
+}

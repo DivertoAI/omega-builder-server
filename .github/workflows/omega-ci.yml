@@ -1,0 +1,82 @@
+name: omega-ci
+
+on:
+  push:
+    branches: [ main, master ]
+  pull_request:
+    branches: [ main, master ]
+
+jobs:
+  build-test-publish:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Cache Docker layers
+        uses: actions/cache@v4
+        with:
+          path: /tmp/.buildx-cache
+          key: ${{ runner.os }}-buildx-${{ github.sha }}
+          restore-keys: |
+            ${{ runner.os }}-buildx-
+
+      - name: Build containers
+        run: |
+          docker compose build
+
+      - name: Spin up stack
+        run: |
+          docker compose up -d
+          echo "Waiting for omega-builder..."
+          for i in {1..30}; do
+            curl -fsS http://localhost:8000/api/health && break || sleep 2
+          done
+          echo "Waiting for ai-vm..."
+          for i in {1..30}; do
+            curl -fsS http://localhost:8080/api/health && break || sleep 2
+          done
+
+      - name: Smoke: scaffold monorepo
+        run: |
+          curl -fsS http://localhost:8000/api/scaffold/monorepo \
+            -H 'content-type: application/json' \
+            -d '{
+              "project":"insta_pharma",
+              "clean_if_exists": true,
+              "apps":[
+                {"name":"customer","org":"com.omega.insta","description":"Customer app"},
+                {"name":"pharmacist","org":"com.omega.insta","description":"Pharmacist app"}
+              ]
+            }' | jq .
+
+      - name: Wire services + build-matrix
+        run: |
+          curl -fsS http://localhost:8000/api/scaffold/wire-services \
+            -H 'content-type: application/json' \
+            -d '{
+              "project":"insta_pharma",
+              "apps":[{"name":"customer"},{"name":"pharmacist"}],
+              "run_bootstrap": true,
+              "build_and_publish": true
+            }' | jq .
+
+      - name: Assert previews exist
+        run: |
+          curl -f http://localhost:8000/preview/insta_pharma/customer/index.html >/dev/null
+          curl -f http://localhost:8000/preview/insta_pharma/pharmacist/index.html >/dev/null
+
+      - name: Scrape metrics
+        run: |
+          echo "---- /api/metrics ----"
+          curl -fsS http://localhost:8000/api/metrics | tee metrics.txt
+          grep -E "omega_build_total|omega_publish_total" metrics.txt
+
+      - name: Teardown
+        if: always()
+        run: docker compose down -v

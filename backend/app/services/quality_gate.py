@@ -1,9 +1,8 @@
-# backend/app/services/quality_gate.py
 from __future__ import annotations
 
 import json
-import subprocess
 import shlex
+import subprocess
 from dataclasses import dataclass, asdict
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple, Union
@@ -43,9 +42,7 @@ def _read_text_safe(p: Path, max_bytes: int = 512_000) -> str:
 
 
 def _try_cmd(cmd: str, cwd: Optional[Path] = None, timeout: int = 25) -> Tuple[int, str, str]:
-    """
-    Run a shell command defensively. Timeouts and failures are reported but not raised.
-    """
+    """Run a shell command defensively. Timeouts and failures are reported but not raised."""
     try:
         proc = subprocess.run(
             shlex.split(cmd),
@@ -56,7 +53,6 @@ def _try_cmd(cmd: str, cwd: Optional[Path] = None, timeout: int = 25) -> Tuple[i
         )
         return proc.returncode, proc.stdout.strip(), proc.stderr.strip()
     except FileNotFoundError:
-        # tool not installed
         return 127, "", f"{cmd.split()[0]}: not found"
     except subprocess.TimeoutExpired:
         return 124, "", "timeout"
@@ -66,9 +62,9 @@ def _try_cmd(cmd: str, cwd: Optional[Path] = None, timeout: int = 25) -> Tuple[i
 
 def _manifest_to_paths(root: Path, manifest: Union[Dict[str, Any], List[Any]]) -> List[Path]:
     """
-    Accepts both the new manifest shape:
+    Accepts both:
       {"files":[{"path":"...","language":"dart",...}, ...], "notes":"..."}
-    and legacy list of paths/objects. Returns absolute Paths (existing or not).
+    and legacy list of strings/objects. Returns absolute Paths.
     """
     paths: List[Path] = []
 
@@ -81,7 +77,6 @@ def _manifest_to_paths(root: Path, manifest: Union[Dict[str, Any], List[Any]]) -
 
     if isinstance(manifest, dict):
         files = manifest.get("files", [])
-        # allow 'files' to be list[str] or list[dict]
         for f in files:
             if isinstance(f, str):
                 add_path(f)
@@ -94,7 +89,6 @@ def _manifest_to_paths(root: Path, manifest: Union[Dict[str, Any], List[Any]]) -
             elif isinstance(f, dict):
                 add_path(str(f.get("path", "")).strip())
 
-    # de-dup while preserving order
     out: List[Path] = []
     seen = set()
     for p in paths:
@@ -105,9 +99,7 @@ def _manifest_to_paths(root: Path, manifest: Union[Dict[str, Any], List[Any]]) -
 
 
 def _basic_file_checks(paths: List[Path]) -> Tuple[List[str], List[str], Dict[str, Any]]:
-    """
-    Generic, language-agnostic checks: existence and non-empty, simple size limits.
-    """
+    """Language-agnostic checks: existence, non-empty, crude size sanity."""
     errors: List[str] = []
     warnings: List[str] = []
     metrics: Dict[str, Any] = {
@@ -128,22 +120,17 @@ def _basic_file_checks(paths: List[Path]) -> Tuple[List[str], List[str], Dict[st
             warnings.append(f"empty: {p}")
         else:
             metrics["nonempty"] += 1
-
-        # crude sanity filters to catch obvious junk
-        if size > 2_000_000:  # 2 MB single file is likely off for generated source
+        if size > 2_000_000:
             warnings.append(f"large-file: {p.name} ~{size} bytes")
 
-        # quick header sniff for common types
         ext = p.suffix.lower()
         if ext in {".dart", ".yaml", ".yml", ".json", ".html", ".css", ".js", ".ts"}:
             head = _read_text_safe(p, max_bytes=500)
             if not head.strip():
                 warnings.append(f"text-empty: {p}")
 
-    # A truly broken artifact set
     if metrics["present"] == 0:
         errors.append("No generated files were found in staging manifest.")
-
     return errors, warnings, metrics
 
 
@@ -152,14 +139,6 @@ def _basic_file_checks(paths: List[Path]) -> Tuple[List[str], List[str], Dict[st
 # -------------------------
 
 def _flutter_checks(root: Path) -> Tuple[List[str], List[str], Dict[str, Any]]:
-    """
-    Light-touch Flutter gating:
-      - pubspec.yaml exists and contains 'flutter:'
-      - lib/main.dart exists and has main() and runApp(
-      - optional: attempt `flutter --version` to confirm tool presence (no failure if missing)
-      - optional: quick syntax probe via `dart --version` (presence only)
-      - optional: `flutter analyze` when tools exist (soft-fail -> warnings)
-    """
     errors: List[str] = []
     warnings: List[str] = []
     metrics: Dict[str, Any] = {}
@@ -183,43 +162,32 @@ def _flutter_checks(root: Path) -> Tuple[List[str], List[str], Dict[str, Any]]:
             warnings.append("Flutter: main.dart missing obvious entrypoint (main() / runApp()).")
         metrics["main_dart_bytes"] = len(main_src.encode("utf-8", errors="ignore"))
 
-    # Tool presence (soft)
-    rc_fv, out_fv, err_fv = _try_cmd("flutter --version", cwd=root)
+    rc_fv, _, _ = _try_cmd("flutter --version", cwd=root)
     metrics["flutter_tool_rc"] = rc_fv
     if rc_fv == 127:
         warnings.append("Flutter SDK not installed on runner; skipped 'flutter analyze'.")
-    elif rc_fv in (0, 124):  # ok or timeout
-        # If available, try a very short analyze (may still be heavy; keep timeout)
+    elif rc_fv in (0, 124):
         rc_an, out_an, err_an = _try_cmd("flutter analyze", cwd=root, timeout=40)
         metrics["flutter_analyze_rc"] = rc_an
-        # We don't fail generation on analyzer warnings—just surface them
         if rc_an not in (0, 124, 127):
             warnings.append("Flutter analyze returned issues (non-blocking).")
             snippet = (out_an or err_an).splitlines()[-20:]
             metrics["flutter_analyze_tail"] = "\n".join(snippet)
 
-    # Dart presence (soft)
-    rc_dv, out_dv, err_dv = _try_cmd("dart --version", cwd=root)
+    rc_dv, _, _ = _try_cmd("dart --version", cwd=root)
     metrics["dart_tool_rc"] = rc_dv
     if rc_dv == 127:
         warnings.append("Dart SDK not installed on runner.")
-
     return errors, warnings, metrics
 
 
 def _web_checks(root: Path) -> Tuple[List[str], List[str], Dict[str, Any]]:
-    """
-    Minimal Web gating:
-      - index.html present and has a <head> and <body>
-      - If a package.json exists, ensure it's valid JSON and has a start/build script (warn-only)
-    """
     errors: List[str] = []
     warnings: List[str] = []
     metrics: Dict[str, Any] = {}
 
     index_html = root / "index.html"
     if not index_html.exists():
-        # support typical scaffolds under web/
         index_html = root / "web" / "index.html"
 
     if not index_html.exists():
@@ -241,8 +209,129 @@ def _web_checks(root: Path) -> Tuple[List[str], List[str], Dict[str, Any]]:
             metrics["package_scripts"] = list(scripts.keys()) if isinstance(scripts, dict) else []
         except Exception:
             warnings.append("Web: package.json is not valid JSON.")
-
     return errors, warnings, metrics
+
+
+# -------------------------
+# North-star readiness checks
+# -------------------------
+
+def _check_design(root: Path) -> Tuple[List[str], List[str], Dict[str, Any]]:
+    errors: List[str] = []
+    warnings: List[str] = []
+    metrics: Dict[str, Any] = {}
+
+    droot = root / "design"
+    fonts = droot / "fonts"
+    tokens = droot / "tokens"
+    theme = droot / "theme"
+
+    metrics["present"] = {
+        "design_dir": droot.exists(),
+        "fonts": fonts.exists(),
+        "tokens": tokens.exists(),
+        "theme": theme.exists(),
+    }
+
+    # tokens
+    tok_file = tokens / "tokens.dart"
+    if not tok_file.exists():
+        warnings.append("Design: tokens.dart missing.")
+    else:
+        src = _read_text_safe(tok_file)
+        for needle in ("class OmegaTokens", "spacing", "radius", "colors"):
+            if needle not in src:
+                warnings.append(f"Design tokens missing hint: {needle}")
+
+    # fonts
+    fonts_file = fonts / "google_fonts.dart"
+    if not fonts_file.exists():
+        warnings.append("Design: fonts/google_fonts.dart missing.")
+    else:
+        ff = _read_text_safe(fonts_file)
+        if "OmegaFonts" not in ff:
+            warnings.append("Design fonts wrapper missing OmegaFonts class.")
+
+    # theme
+    theme_file = theme / "omega_theme.dart"
+    if not theme_file.exists():
+        warnings.append("Design: theme/omega_theme.dart missing.")
+    else:
+        th = _read_text_safe(theme_file)
+        if "buildOmegaTheme" not in th:
+            warnings.append("Design theme missing buildOmegaTheme().")
+
+    ready = all(metrics["present"].values())
+    metrics["ready"] = ready
+    return errors, warnings, metrics
+
+
+def _dir_stats(p: Path, exts: Optional[set[str]] = None) -> Tuple[int, int]:
+    count = 0
+    total = 0
+    if not p.exists():
+        return 0, 0
+    for child in p.rglob("*"):
+        if child.is_file():
+            if exts:
+                if child.suffix.lower() not in exts:
+                    continue
+            count += 1
+            try:
+                total += child.stat().st_size
+            except Exception:
+                pass
+    return count, total
+
+
+def _check_assets(root: Path) -> Tuple[List[str], List[str], Dict[str, Any]]:
+    warnings: List[str] = []
+    assets_root = root / "assets"
+    count, total = _dir_stats(assets_root, {".png", ".jpg", ".jpeg", ".webp", ".svg"})
+    metrics = {
+        "assets_dir": str(assets_root),
+        "images_count": count,
+        "images_bytes": total,
+        "ready": count > 0,
+    }
+    if count == 0:
+        warnings.append("Assets: no images found under /assets.")
+    return [], warnings, metrics
+
+
+def _check_infra(root: Path) -> Tuple[List[str], List[str], Dict[str, Any]]:
+    warnings: List[str] = []
+    infra = root / "infra"
+    dc = infra / "docker-compose.yml"
+    envex = infra / ".env.example"
+    ci = infra / "ci-preview.yml"
+
+    present = {
+        "infra_dir": infra.exists(),
+        "docker_compose": dc.exists(),
+        "env_example": envex.exists(),
+        "ci_preview": ci.exists(),
+    }
+    ready = all(present.values())
+    metrics = {"present": present, "ready": ready}
+    if not ready:
+        warnings.append("Infra: expected docker-compose.yml, .env.example, ci-preview.yml under /infra.")
+    return [], warnings, metrics
+
+
+def _check_adapters(root: Path) -> Tuple[List[str], List[str], Dict[str, Any]]:
+    warnings: List[str] = []
+    adapters = root / "adapters"
+    stubs = {
+        "payments_adapter.dart": (adapters / "payments_adapter.dart").exists(),
+        "ocr_adapter.dart": (adapters / "ocr_adapter.dart").exists(),
+        "telemed_adapter.dart": (adapters / "telemed_adapter.dart").exists(),
+        "logistics_adapter.dart": (adapters / "logistics_adapter.dart").exists(),
+    }
+    ready = all(stubs.values())
+    if not ready:
+        warnings.append("Adapters: one or more adapter stubs are missing under /adapters.")
+    return [], warnings, {"present": stubs, "ready": ready}
 
 
 # -------------------------
@@ -256,17 +345,7 @@ def run_quality_gate(
 ) -> GateResult:
     """
     Performs quality checks over generated artifacts described by `manifest`.
-
-    - Understands new manifest shape {"files":[...], "notes": "..."} and legacy lists.
-    - Applies generic file checks plus target-specific checks:
-        * Flutter (if it looks like a Flutter project)
-        * Web (fallback minimal checks)
-    - Honors feature flags in settings:
-        * gate_enable_compile_guard
-        * gate_enable_mvvm_checks (advisory only for Flutter)
-        * gate_enable_web_checks
-
-    Returns GateResult with pass/fail, errors, warnings, metrics, and a short summary.
+    Also reports north-star readiness for design/assets/infra/adapters.
     """
     staging = staging_root or settings.staging_root
     staging = Path(staging).resolve()
@@ -282,30 +361,20 @@ def run_quality_gate(
         },
     }
 
-    # 1) Expand manifest to absolute file paths
+    # 1) Expand manifest + generic checks
     paths = _manifest_to_paths(staging, manifest)
     e0, w0, m0 = _basic_file_checks(paths)
     errors.extend(e0)
     warnings.extend(w0)
-    metrics.update(m0)  # merge basic metrics
+    metrics.update(m0)
 
-    # Early exit if nothing to check
     if errors and metrics.get("present", 0) == 0:
         summary = "No files present to check. Failing gate."
         return GateResult(False, errors, warnings, metrics, summary)
 
-    # 2) Detect target (best-effort)
-    # FIX: don't pass a boolean into any(); just compute booleans directly
-    looks_flutter = (
-        (staging / "pubspec.yaml").exists()
-        or (staging / "lib" / "main.dart").exists()
-    )
-    looks_web = (
-        (staging / "index.html").exists()
-        or (staging / "web" / "index.html").exists()
-    )
-
-    # If neither obvious, infer from file extensions/filenames found in manifest
+    # 2) Target detection
+    looks_flutter = (staging / "pubspec.yaml").exists() or (staging / "lib" / "main.dart").exists()
+    looks_web = (staging / "index.html").exists() or (staging / "web" / "index.html").exists()
     if not looks_flutter and not looks_web:
         for p in paths:
             if p.suffix == ".dart":
@@ -321,7 +390,6 @@ def run_quality_gate(
         warnings.extend(w1)
         metrics["flutter"] = m1
 
-        # Optional advisory MVVM checks (structure only)
         if settings.gate_enable_mvvm_checks:
             mvvm_warnings: List[str] = []
             lib_dir = staging / "lib"
@@ -329,17 +397,29 @@ def run_quality_gate(
                 for folder in ("core", "features"):
                     if not (lib_dir / folder).exists():
                         mvvm_warnings.append(f"Advisory: Consider 'lib/{folder}/' for modular structure.")
-            if mvvm_warnings:
-                warnings.extend(mvvm_warnings)
+            warnings.extend(mvvm_warnings)
 
-    # If not Flutter, try minimal web checks (or both if hybrid)
     if (not looks_flutter and looks_web) and settings.gate_enable_web_checks:
         e2, w2, m2 = _web_checks(staging)
         errors.extend(e2)
         warnings.extend(w2)
         metrics["web"] = m2
 
-    # 4) Finalize
+    # 4) North-star readiness
+    de, dw, dm = _check_design(staging)
+    ae, aw, am = _check_assets(staging)
+    ie, iw, im = _check_infra(staging)
+    ce, cw, cm = _check_adapters(staging)
+    errors += de + ae + ie + ce
+    warnings += dw + aw + iw + cw
+    metrics["readiness"] = {
+        "design": dm,
+        "assets": am,
+        "infra": im,
+        "adapters": cm,
+    }
+
+    # 5) Finalize
     passed = len(errors) == 0
     summary = (
         "Quality gate passed."

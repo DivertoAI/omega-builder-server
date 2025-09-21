@@ -1,0 +1,5 @@
+[
+  {"id":"p-ibuprofen","name":"Ibuprofen 200mg","price":6.99,"image":"/assets/hero.svg"},
+  {"id":"p-vitamin-c","name":"Vitamin C 1000mg","price":12.50,"image":"/assets/hero.svg"},
+  {"id":"p-cough-syrup","name":"Cough Syrup 120ml","price":9.99,"image":"/assets/hero.svg"}
+]

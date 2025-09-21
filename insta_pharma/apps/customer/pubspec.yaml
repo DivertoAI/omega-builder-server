@@ -1,0 +1,33 @@
+name: customer
+description: "Insta Pharma – Customer app"
+publish_to: "none"
+
+version: 1.0.0+1
+
+environment:
+  sdk: ^3.9.2
+
+dependencies:
+  flutter:
+    sdk: flutter
+  cupertino_icons: ^1.0.8
+
+  design_system:
+    path: ../../packages/design_system
+  api_client:
+    path: ../../services/api_client
+  auth:
+    path: ../../services/auth
+  models:
+    path: ../../services/models
+
+dev_dependencies:
+  flutter_test:
+    sdk: flutter
+  flutter_lints: ^5.0.0
+
+flutter:
+  uses-material-design: true
+  assets:
+    - assets/
+    - ../../assets/mock/products.json

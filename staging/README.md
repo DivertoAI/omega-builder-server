@@ -1,18 +1,33 @@
-# Hello Button App
+InstaPharma
 
-A minimal single-screen Flutter app that displays "Hello" text and a button.
+A minimal scaffold for an e-prescription and medication ordering platform. Ships a simple SPA shell (Dashboard, Orders, Prescriptions, Pharmacies, Profile) and a health endpoint.
 
-Run (Web):
-- Ensure Flutter SDK is installed and Chrome is available.
-- From the project root:
-  1. flutter pub get
-  2. flutter run -d chrome
+Features
+- SPA shell with navigation; home: Dashboard
+- Node.js/Express server
+- Health endpoint: GET /health -> { "status": "ok" }
 
-Health endpoint (acceptance):
-- When running on web, the dev server serves a static health endpoint.
-- Copy the local URL printed by Flutter (e.g., http://localhost:12345), then open or curl:
-  - curl http://localhost:12345/health
-- Expected response: "ok"
+Quick start
+1) Install dependencies
+   npm install
 
-Notes:
-- The app defines a single route named "/home" matching the spec's navigation.home.
+2) Start the service
+   npm start
+
+3) Open the app
+   http://localhost:3000
+
+Health check
+- Endpoint: GET /health
+- Expected: { "status": "ok" }
+
+Navigation routes
+- #/dashboard (home)
+- #/orders
+- #/prescriptions
+- #/pharmacies
+- #/profile
+
+Project structure
+- server.js: Express server and /health
+- public/: Static SPA assets (index.html, app.js, styles.css)
