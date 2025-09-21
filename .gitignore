@@ -20,6 +20,7 @@ node_modules/
 # Env & local
 .env
 .env.*.local
+.env.example
 
 # Workspace artifacts
 workspace/
